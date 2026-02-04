@@ -1,0 +1,24 @@
+[build-system]
+requires = ["scikit-build-core>=0.7", "pybind11>=2.10", "numpy<2"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ztu_somemodelruntime_ez_rknn_async"
+version = "0.1.0"
+description = "RKNN async inference Python bindings"
+requires-python = ">=3.8"
+dependencies = ["numpy<2"]
+authors = [
+  { name="hallo1", email="happyme5315@gmail.com" },
+]
+
+[project.urls]
+"Homepage" = "https://github.com/happyme531/ztu_somemodelruntime_ez_rknn_async"
+
+[tool.scikit-build]
+wheel.packages = ["python/ztu_somemodelruntime_ez_rknn_async"]
+sdist.include = ["src/**", "python/**", "lib/librknnrt.so", "CMakeLists.txt"]
+
+[tool.scikit-build.cmake]
+minimum-version = "3.18"
+build-type = "Release"
