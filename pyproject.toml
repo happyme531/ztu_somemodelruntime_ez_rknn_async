@@ -6,14 +6,33 @@ build-backend = "scikit_build_core.build"
 name = "ztu_somemodelruntime_ez_rknn_async"
 version = "0.2.0"
 description = "RKNN async inference Python bindings"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
 dependencies = ["numpy<2"]
 authors = [
   { name="hallo1", email="happyme5315@gmail.com" },
 ]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: C++",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/happyme531/ztu_somemodelruntime_ez_rknn_async"
+"Repository" = "https://github.com/happyme531/ztu_somemodelruntime_ez_rknn_async"
+"Issues" = "https://github.com/happyme531/ztu_somemodelruntime_ez_rknn_async/issues"
 
 [tool.scikit-build]
 wheel.packages = ["python/ztu_somemodelruntime_ez_rknn_async"]
