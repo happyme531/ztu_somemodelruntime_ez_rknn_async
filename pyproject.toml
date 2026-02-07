@@ -1,15 +1,20 @@
 [build-system]
-requires = ["scikit-build-core>=0.7", "pybind11>=2.10", "numpy<2"]
+requires = [
+  "scikit-build-core>=0.7",
+  "pybind11>=2.10",
+]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "ztu_somemodelruntime_ez_rknn_async"
-version = "0.2.0"
+version = "0.2.1"
 description = "RKNN async inference Python bindings"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
-dependencies = ["numpy<2"]
+dependencies = [
+  "numpy>=1.21",
+]
 authors = [
   { name="hallo1", email="happyme5315@gmail.com" },
 ]
