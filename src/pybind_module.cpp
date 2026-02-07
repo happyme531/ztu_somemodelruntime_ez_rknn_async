@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -37,6 +38,22 @@ struct NodeArgInfo {
   std::vector<int64_t> shape;
   std::string type;
 };
+
+struct SessionConfig {
+  std::string layout = "nchw_software";
+  size_t max_queue_size = 3;
+  int threads_per_core = 1;
+  bool sequential_callbacks = true;
+  std::vector<uint64_t> schedule = {0};
+  bool enable_pacing = false;
+};
+
+template <typename T> std::shared_ptr<T> make_py_shared(T obj) {
+  return std::shared_ptr<T>(new T(std::move(obj)), [](T *p) {
+    py::gil_scoped_acquire gil;
+    delete p;
+  });
+}
 
 rknn_tensor_type dtype_to_rknn(const py::dtype &dtype) {
   if (dtype.is(py::dtype::of<float>())) {
@@ -126,6 +143,189 @@ std::string rknn_type_to_onnx_str(rknn_tensor_type type) {
   }
 }
 
+std::string trim_string(const std::string &input) {
+  size_t start = 0;
+  while (start < input.size() &&
+         std::isspace(static_cast<unsigned char>(input[start]))) {
+    ++start;
+  }
+  size_t end = input.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+    --end;
+  }
+  return input.substr(start, end - start);
+}
+
+int64_t parse_int_like(py::handle value, const char *name) {
+  if (py::isinstance<py::int_>(value)) {
+    return py::cast<int64_t>(value);
+  }
+  if (py::isinstance<py::str>(value)) {
+    std::string text = trim_string(py::cast<std::string>(value));
+    size_t idx = 0;
+    long long parsed = 0;
+    try {
+      parsed = std::stoll(text, &idx);
+    } catch (...) {
+      throw std::runtime_error(std::string(name) + " must be an integer");
+    }
+    if (idx != text.size()) {
+      throw std::runtime_error(std::string(name) + " must be an integer");
+    }
+    return static_cast<int64_t>(parsed);
+  }
+  throw std::runtime_error(std::string(name) + " must be an integer");
+}
+
+bool parse_bool_like(py::handle value, const char *name) {
+  if (py::isinstance<py::bool_>(value)) {
+    return py::cast<bool>(value);
+  }
+  if (py::isinstance<py::int_>(value)) {
+    return py::cast<int64_t>(value) != 0;
+  }
+  if (py::isinstance<py::str>(value)) {
+    std::string text = trim_string(py::cast<std::string>(value));
+    for (auto &c : text) {
+      c = static_cast<char>(::tolower(c));
+    }
+    if (text == "1" || text == "true" || text == "on" || text == "yes") {
+      return true;
+    }
+    if (text == "0" || text == "false" || text == "off" || text == "no") {
+      return false;
+    }
+  }
+  throw std::runtime_error(std::string(name) + " must be a boolean");
+}
+
+std::vector<uint64_t> parse_schedule_like(py::handle value) {
+  std::vector<uint64_t> schedule;
+  if (py::isinstance<py::int_>(value) || py::isinstance<py::str>(value)) {
+    if (py::isinstance<py::int_>(value)) {
+      int64_t core = parse_int_like(value, "schedule");
+      if (core < 0) {
+        throw std::runtime_error("schedule values must be >= 0");
+      }
+      schedule.push_back(static_cast<uint64_t>(core));
+    } else {
+      std::string text = py::cast<std::string>(value);
+      for (auto &c : text) {
+        if (c == '[' || c == ']' || c == ',') {
+          c = ' ';
+        }
+      }
+      std::stringstream ss(text);
+      std::string token;
+      while (ss >> token) {
+        size_t idx = 0;
+        long long parsed = 0;
+        try {
+          parsed = std::stoll(token, &idx);
+        } catch (...) {
+          throw std::runtime_error("schedule must contain integers");
+        }
+        if (idx != token.size()) {
+          throw std::runtime_error("schedule must contain integers");
+        }
+        if (parsed < 0) {
+          throw std::runtime_error("schedule values must be >= 0");
+        }
+        schedule.push_back(static_cast<uint64_t>(parsed));
+      }
+    }
+  } else if (py::isinstance<py::sequence>(value)) {
+    py::sequence seq = value.cast<py::sequence>();
+    schedule.reserve(seq.size());
+    for (auto item : seq) {
+      int64_t core = parse_int_like(item, "schedule");
+      if (core < 0) {
+        throw std::runtime_error("schedule values must be >= 0");
+      }
+      schedule.push_back(static_cast<uint64_t>(core));
+    }
+  } else {
+    throw std::runtime_error(
+        "schedule must be an integer, string, or sequence");
+  }
+  if (schedule.empty()) {
+    throw std::runtime_error("schedule must not be empty");
+  }
+  return schedule;
+}
+
+py::dict extract_provider_options(const py::object &provider_options_obj) {
+  if (provider_options_obj.is_none()) {
+    return py::dict();
+  }
+  if (py::isinstance<py::dict>(provider_options_obj)) {
+    return provider_options_obj.cast<py::dict>();
+  }
+  if (py::isinstance<py::sequence>(provider_options_obj)) {
+    py::sequence seq = provider_options_obj.cast<py::sequence>();
+    if (seq.size() == 0) {
+      return py::dict();
+    }
+    py::object first = seq[0];
+    if (py::isinstance<py::dict>(first)) {
+      return first.cast<py::dict>();
+    }
+  }
+  throw std::runtime_error("provider_options must be a dict or a sequence "
+                           "whose first element is a dict");
+}
+
+SessionConfig parse_session_config(const py::object &provider_options_obj) {
+  SessionConfig config;
+  py::dict opts = extract_provider_options(provider_options_obj);
+  for (auto item : opts) {
+    std::string key = py::cast<std::string>(item.first);
+    if (key == "layout") {
+      config.layout = py::cast<std::string>(item.second);
+      continue;
+    }
+    if (key == "max_queue_size") {
+      int64_t value = parse_int_like(item.second, "max_queue_size");
+      if (value <= 0) {
+        throw std::runtime_error("max_queue_size must be > 0");
+      }
+      config.max_queue_size = static_cast<size_t>(value);
+      continue;
+    }
+    if (key == "threads_per_core") {
+      int64_t value = parse_int_like(item.second, "threads_per_core");
+      if (value <= 0) {
+        throw std::runtime_error("threads_per_core must be > 0");
+      }
+      config.threads_per_core = static_cast<int>(value);
+      continue;
+    }
+    if (key == "sequential_callbacks") {
+      config.sequential_callbacks = parse_bool_like(item.second, key.c_str());
+      continue;
+    }
+    if (key == "schedule") {
+      config.schedule = parse_schedule_like(item.second);
+      continue;
+    }
+    if (key == "enable_pacing") {
+      config.enable_pacing = parse_bool_like(item.second, key.c_str());
+      continue;
+    }
+  }
+  return config;
+}
+
+std::string resolve_model_path(const py::object &path_or_bytes) {
+  if (py::isinstance<py::bytes>(path_or_bytes)) {
+    throw std::runtime_error("bytes model content is not supported yet; please "
+                             "pass a filesystem path");
+  }
+  py::object os_path = py::module_::import("os").attr("fspath")(path_or_bytes);
+  return py::cast<std::string>(os_path);
+}
+
 ParsedInput parse_array(py::array array, size_t expected_elems,
                         bool allow_batch) {
   if (!array) {
@@ -211,16 +411,59 @@ py::object outputs_to_python(const AsyncEzRknn::InferenceResult &outputs,
   return result;
 }
 
+py::list build_outputs_by_indices(const AsyncEzRknn::InferenceResult &outputs,
+                                  const std::vector<rknn_tensor_attr> &attrs,
+                                  const std::vector<size_t> &indices) {
+  py::list result;
+  for (size_t idx : indices) {
+    if (idx >= outputs.size() || idx >= attrs.size()) {
+      throw std::runtime_error("Output index out of range");
+    }
+    result.append(make_output_array(outputs[idx], attrs[idx]));
+  }
+  return result;
+}
+
+bool parse_dispatch_batch_flag(const py::object &run_options_obj) {
+  constexpr const char *kDispatchKey = "ztu_modelrt_dispatch_batch";
+  if (run_options_obj.is_none()) {
+    return false;
+  }
+  if (py::isinstance<py::dict>(run_options_obj)) {
+    py::dict opts = run_options_obj.cast<py::dict>();
+    py::object key = py::str(kDispatchKey);
+    if (!opts.contains(key)) {
+      return false;
+    }
+    return parse_bool_like(opts[key], kDispatchKey);
+  }
+  if (py::hasattr(run_options_obj, "get_run_config_entry")) {
+    try {
+      py::object value =
+          run_options_obj.attr("get_run_config_entry")(kDispatchKey);
+      return parse_bool_like(value, kDispatchKey);
+    } catch (const py::error_already_set &) {
+      PyErr_Clear();
+      return false;
+    }
+  }
+  return false;
+}
+
 class InferenceSession {
 public:
-  InferenceSession(const std::string &model_path, const std::string &layout,
-                   size_t max_queue_size, int threads_per_core,
-                   bool sequential_callbacks, std::vector<uint64_t> schedule,
-                   bool enable_pacing)
+  ~InferenceSession() {
+    // Avoid deadlock: Async worker/callback threads may need the GIL while
+    // shutting down callbacks that hold Python objects.
+    py::gil_scoped_release release;
+    rknn_.reset();
+  }
+
+  InferenceSession(const std::string &model_path, const SessionConfig &config)
       : pipeline_depth_(0), pipeline_initialized_(false),
         nchw_software_(false) {
     AsyncEzRknn::Layout layout_enum = AsyncEzRknn::Layout::ORIGINAL;
-    std::string layout_lower = layout;
+    std::string layout_lower = config.layout;
     for (auto &c : layout_lower) {
       c = static_cast<char>(::tolower(c));
     }
@@ -235,12 +478,12 @@ public:
     } else if (layout_lower == "any") {
       layout_enum = AsyncEzRknn::Layout::ANY;
     } else {
-      throw std::runtime_error("Unknown layout: " + layout);
+      throw std::runtime_error("Unknown layout: " + config.layout);
     }
 
     rknn_ = std::make_unique<AsyncEzRknn>(
-        model_path, layout_enum, max_queue_size, threads_per_core,
-        sequential_callbacks, std::move(schedule), enable_pacing);
+        model_path, layout_enum, config.max_queue_size, config.threads_per_core,
+        config.sequential_callbacks, config.schedule, config.enable_pacing);
 
     input_attrs_ = rknn_->input_attrs;
     output_attrs_ = rknn_->output_attrs;
@@ -281,115 +524,64 @@ public:
   }
 
   py::list run(py::object output_names_obj, py::object input_feed,
-               const std::string &mode) {
-    std::string mode_lower = mode;
-    for (auto &c : mode_lower) {
-      c = static_cast<char>(::tolower(c));
-    }
+               py::object run_options) {
+    bool dispatch_batch = parse_dispatch_batch_flag(run_options);
     auto output_indices =
         resolve_output_indices(output_names_obj, output_names_);
-
-    if (mode_lower == "sync") {
-      auto inputs = parse_input_feed(input_feed, false);
-      auto outputs = run_sync(std::move(inputs));
-      return build_outputs(outputs, output_indices);
-    }
-    if (mode_lower == "batch") {
-      auto inputs = parse_input_feed(input_feed, true);
+    auto inputs = parse_input_feed(input_feed, dispatch_batch);
+    if (dispatch_batch) {
       return run_batch(std::move(inputs), output_indices);
     }
-
-    throw std::runtime_error("Unknown run mode: " + mode);
+    auto outputs = run_sync(std::move(inputs));
+    return build_outputs(outputs, output_indices);
   }
 
-  py::object run_async(py::object input_feed, py::object callback,
-                       py::object loop) {
-    auto inputs = parse_input_feed(input_feed, false);
-
-    if (!callback.is_none()) {
-      if (!PyCallable_Check(callback.ptr())) {
-        throw std::runtime_error("callback must be callable");
-      }
-      auto cb_shared =
-          std::make_shared<py::function>(callback.cast<py::function>());
-      auto attrs_shared =
-          std::make_shared<std::vector<rknn_tensor_attr>>(output_attrs_);
-      auto submit = submit_task_async(
-          std::move(inputs),
-          [cb_shared, attrs_shared](size_t task_id,
-                                    AsyncEzRknn::InferenceResult outputs) {
-            py::gil_scoped_acquire gil;
-            try {
-              if (outputs.empty()) {
-                (*cb_shared)(task_id, py::none());
-                return;
-              }
-              (*cb_shared)(task_id, outputs_to_python(outputs, *attrs_shared));
-            } catch (const py::error_already_set &e) {
-              PyErr_WriteUnraisable(e.value().ptr());
-            }
-          });
-
-      if (!submit.has_value()) {
-        return py::none();
-      }
-      return py::int_(static_cast<size_t>(*submit));
+  py::none run_async(py::object output_names_obj, py::object input_feed,
+                     py::object callback, py::object user_data,
+                     py::object run_options) {
+    if (callback.is_none() || !PyCallable_Check(callback.ptr())) {
+      throw std::runtime_error("callback must be callable");
+    }
+    if (parse_dispatch_batch_flag(run_options)) {
+      throw std::runtime_error(
+          "run_async does not support ztu_modelrt_dispatch_batch=True");
     }
 
-    auto future_ctx = create_future(loop);
-    auto future_obj = future_ctx.future;
-    auto loop_obj = future_ctx.loop;
-    bool use_asyncio = future_ctx.use_asyncio;
-
-    auto future_shared = std::make_shared<py::object>(future_obj);
-    auto loop_shared = std::make_shared<py::object>(loop_obj);
+    auto output_indices =
+        resolve_output_indices(output_names_obj, output_names_);
+    auto inputs = parse_input_feed(input_feed, false);
+    auto cb_shared = make_py_shared(callback.cast<py::function>());
+    auto user_data_shared = make_py_shared(user_data);
     auto attrs_shared =
         std::make_shared<std::vector<rknn_tensor_attr>>(output_attrs_);
+    auto indices_shared =
+        std::make_shared<std::vector<size_t>>(std::move(output_indices));
 
-    auto submit = submit_task_async(
+    submit_task_async_blocking(
         std::move(inputs),
-        [future_shared, loop_shared, use_asyncio,
-         attrs_shared](size_t, AsyncEzRknn::InferenceResult outputs) {
+        [cb_shared, user_data_shared, attrs_shared,
+         indices_shared](size_t, AsyncEzRknn::InferenceResult outputs) {
           py::gil_scoped_acquire gil;
           try {
             if (outputs.empty()) {
-              py::object err = py::module_::import("builtins")
-                                   .attr("RuntimeError")("Inference failed");
-              if (use_asyncio) {
-                (*loop_shared)
-                    .attr("call_soon_threadsafe")(
-                        (*future_shared).attr("set_exception"), err);
-              } else {
-                (*future_shared).attr("set_exception")(err);
-              }
+              (*cb_shared)(py::none(), *user_data_shared,
+                           py::str("Inference failed"));
               return;
             }
-            py::object result = outputs_to_python(outputs, *attrs_shared);
-            if (use_asyncio) {
-              (*loop_shared)
-                  .attr("call_soon_threadsafe")(
-                      (*future_shared).attr("set_result"), result);
-            } else {
-              (*future_shared).attr("set_result")(result);
-            }
+            py::list result = build_outputs_by_indices(outputs, *attrs_shared,
+                                                       *indices_shared);
+            (*cb_shared)(result, *user_data_shared, py::str(""));
           } catch (const py::error_already_set &e) {
             PyErr_WriteUnraisable(e.value().ptr());
+          } catch (const std::exception &e) {
+            try {
+              (*cb_shared)(py::none(), *user_data_shared, py::str(e.what()));
+            } catch (const py::error_already_set &e2) {
+              PyErr_WriteUnraisable(e2.value().ptr());
+            }
           }
         });
-
-    if (!submit.has_value()) {
-      py::gil_scoped_acquire gil;
-      py::object err = py::module_::import("builtins")
-                           .attr("RuntimeError")("Task queue full");
-      if (use_asyncio) {
-        loop_obj.attr("call_soon_threadsafe")(future_obj.attr("set_exception"),
-                                              err);
-      } else {
-        future_obj.attr("set_exception")(err);
-      }
-    }
-
-    return future_obj;
+    return py::none();
   }
 
   py::object run_pipeline(py::object input_feed, size_t depth, bool reset) {
@@ -440,12 +632,6 @@ public:
   }
 
 private:
-  struct FutureContext {
-    py::object future;
-    py::object loop;
-    bool use_asyncio = false;
-  };
-
   std::vector<ParsedInput> parse_input_feed(const py::object &input_feed,
                                             bool allow_batch) {
     size_t expected_inputs = input_attrs_.size();
@@ -535,11 +721,16 @@ private:
     return views;
   }
 
-  std::optional<size_t>
-  submit_task_async(std::vector<ParsedInput> inputs,
-                    AsyncEzRknn::InferenceCallback callback) {
+  void submit_task_async_blocking(std::vector<ParsedInput> inputs,
+                                  AsyncEzRknn::InferenceCallback callback) {
     auto views = to_input_views(inputs);
-    return rknn_->asyncInferenceDyn(std::move(callback), views);
+    while (true) {
+      auto submitted = rknn_->asyncInferenceDyn(callback, views);
+      if (submitted.has_value()) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
 
   std::future<AsyncEzRknn::InferenceResult>
@@ -686,35 +877,6 @@ private:
     return result;
   }
 
-  FutureContext create_future(py::object loop) {
-    FutureContext ctx;
-    if (!loop.is_none()) {
-      ctx.loop = loop;
-      ctx.use_asyncio = true;
-      ctx.future = ctx.loop.attr("create_future")();
-      return ctx;
-    }
-
-    py::module_ asyncio = py::module_::import("asyncio");
-    try {
-      ctx.loop = asyncio.attr("get_running_loop")();
-      ctx.use_asyncio = true;
-      ctx.future = ctx.loop.attr("create_future")();
-      return ctx;
-    } catch (const py::error_already_set &e) {
-      if (!e.matches(PyExc_RuntimeError)) {
-        throw;
-      }
-      PyErr_Clear();
-    }
-
-    py::module_ futures = py::module_::import("concurrent.futures");
-    ctx.future = futures.attr("Future")();
-    ctx.use_asyncio = false;
-    ctx.loop = py::none();
-    return ctx;
-  }
-
   static std::vector<NodeArgInfo>
   build_node_args(const std::vector<rknn_tensor_attr> &attrs,
                   const std::vector<std::string> &names) {
@@ -756,35 +918,46 @@ PYBIND11_MODULE(_core, m) {
                              [](const NodeArgInfo &info) { return info.name; })
       .def_property_readonly("shape",
                              [](const NodeArgInfo &info) { return info.shape; })
-      .def_property_readonly("type",
-                             [](const NodeArgInfo &info) { return info.type; },
-                             "Type string like 'tensor(float32)'.");
+      .def_property_readonly(
+          "type", [](const NodeArgInfo &info) { return info.type; },
+          "Type string like 'tensor(float32)'.");
 
   py::class_<InferenceSession>(m, "InferenceSession")
-      .def(py::init<const std::string &, const std::string &, size_t, int, bool,
-                    std::vector<uint64_t>, bool>(),
-           py::arg("model_path"), py::arg("layout") = "nchw_software",
-           py::arg("max_queue_size") = 3, py::arg("threads_per_core") = 1,
-           py::arg("sequential_callbacks") = true,
-           py::arg("schedule") = std::vector<uint64_t>{0},
-           py::arg("enable_pacing") = false,
+      .def(py::init([](py::object path_or_bytes, py::object sess_options,
+                       py::object providers, py::object provider_options,
+                       py::kwargs kwargs) {
+             (void)sess_options;
+             (void)providers;
+             (void)kwargs;
+             SessionConfig config = parse_session_config(provider_options);
+             return std::make_unique<InferenceSession>(
+                 resolve_model_path(path_or_bytes), config);
+           }),
+           py::arg("path_or_bytes"), py::arg("sess_options") = py::none(),
+           py::arg("providers") = py::none(),
+           py::arg("provider_options") = py::none(),
            "Create an inference session.\n\n"
-           "layout: 'nchw', 'nhwc', or 'nchw_software' (default).")
+           "ORT-style constructor. provider_options carries RKNN runtime "
+           "options.")
       .def("run", &InferenceSession::run, py::arg("output_names") = py::none(),
-           py::arg("input_feed"), py::arg("mode") = "sync",
+           py::arg("input_feed"), py::arg("run_options") = py::none(),
            "Run inference.\n\n"
            "output_names: list of output names or None for all.\n"
-           "input_feed: dict(name->ndarray), list/tuple of ndarrays, or a single ndarray.\n"
-           "mode: 'sync' or 'batch'.")
-      .def("run_async", &InferenceSession::run_async, py::arg("input_feed"),
-           py::arg("callback") = py::none(), py::arg("loop") = py::none(),
+           "input_feed: dict(name->ndarray), list/tuple of ndarrays, or a "
+           "single ndarray.\n"
+           "run_options: supports key 'ztu_modelrt_dispatch_batch' (bool).")
+      .def("run_async", &InferenceSession::run_async, py::arg("output_names"),
+           py::arg("input_feed"), py::arg("callback"),
+           py::arg("user_data") = py::none(),
+           py::arg("run_options") = py::none(),
            "Run inference asynchronously.\n\n"
-           "If callback is provided, it is called as callback(task_id, outputs).\n"
-           "Otherwise returns a Future (asyncio if loop is running, else concurrent.futures).")
+           "ORT-style callback signature: callback(results, user_data, err).\n"
+           "Returns None.")
       .def("run_pipeline", &InferenceSession::run_pipeline,
            py::arg("input_feed"), py::arg("depth") = 3,
            py::arg("reset") = false,
-           "Pipeline mode. Returns None until the pipeline is filled, then returns\n"
+           "Pipeline mode. Returns None until the pipeline is filled, then "
+           "returns\n"
            "the oldest pending result. Use reset=True to clear the pipeline.")
       .def("get_inputs", &InferenceSession::get_inputs,
            "Return input NodeArg list (onnxruntime-style).")
@@ -793,5 +966,5 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly("input_names", &InferenceSession::input_names)
       .def_property_readonly("output_names", &InferenceSession::output_names);
 
-  m.attr("__version__") = "0.1.0";
+  m.attr("__version__") = "0.2.0";
 }
