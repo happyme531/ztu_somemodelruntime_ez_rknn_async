@@ -1,3 +1,4 @@
+#include <iostream>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -450,6 +451,12 @@ bool parse_dispatch_batch_flag(const py::object &run_options_obj) {
   return false;
 }
 
+void emit_python_user_warning(const std::string &message) {
+  py::module_ warnings = py::module_::import("warnings");
+  py::object user_warning = py::module_::import("builtins").attr("UserWarning");
+  warnings.attr("warn")(py::str(message), user_warning, 2);
+}
+
 class InferenceSession {
 public:
   ~InferenceSession() {
@@ -484,6 +491,9 @@ public:
     rknn_ = std::make_unique<AsyncEzRknn>(
         model_path, layout_enum, config.max_queue_size, config.threads_per_core,
         config.sequential_callbacks, config.schedule, config.enable_pacing);
+    if (rknn_->sdk_version_warning().has_value()) {
+      emit_python_user_warning(rknn_->sdk_version_warning().value());
+    }
 
     input_attrs_ = rknn_->input_attrs;
     output_attrs_ = rknn_->output_attrs;

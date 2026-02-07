@@ -17,7 +17,7 @@ authors = [
 
 [tool.scikit-build]
 wheel.packages = ["python/ztu_somemodelruntime_ez_rknn_async"]
-sdist.include = ["src/**", "python/**", "lib/librknnrt.so", "CMakeLists.txt"]
+sdist.include = ["src/**", "python/**", "CMakeLists.txt"]
 
 [tool.scikit-build.cmake]
 minimum-version = "3.18"

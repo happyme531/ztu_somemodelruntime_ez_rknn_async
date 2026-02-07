@@ -33,6 +33,10 @@ jobs:
           CIBW_ARCHS_LINUX: aarch64
           CIBW_BUILD: cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*
           CIBW_SKIP: "*-musllinux_*"
+          CIBW_BEFORE_ALL_LINUX: >-
+            curl -fL https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so -o /usr/local/lib/librknnrt.so &&
+            chmod 755 /usr/local/lib/librknnrt.so &&
+            ldconfig
         run: python -m cibuildwheel --output-dir wheelhouse
 
       - name: Create GitHub Release

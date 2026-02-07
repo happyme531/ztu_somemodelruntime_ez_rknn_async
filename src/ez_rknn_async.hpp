@@ -2,7 +2,9 @@
 
 #include "rknn_api.h"
 #include <any>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono> // 用于时间记录
 #include <condition_variable>
 #include <cstddef>
@@ -562,6 +564,9 @@ public:
   std::vector<rknn_tensor_attr> input_attrs;
   std::vector<rknn_tensor_attr> output_attrs;
   std::vector<rknn_context> contexts; // 每个工作线程拥有独立的上下文
+  const std::optional<std::string> &sdk_version_warning() const {
+    return sdk_version_warning_;
+  }
 
 private:
   // Pacing / Smoothing members
@@ -612,6 +617,7 @@ private:
 #if ZTU_EZRKNN_ASYNC_HAS_CUSTOM_OP
   std::vector<void *> so_handles_;
 #endif
+  std::optional<std::string> sdk_version_warning_;
 
   // 修改后的 enqueueCallback 函数，直接添加回调，不阻塞等待
   void enqueueCallback(size_t taskId, std::function<void()> cb) {
@@ -637,6 +643,71 @@ private:
     callbackCond.notify_all();
   }
 
+  static bool parse_version_triplet(const char *version_text,
+                                    std::array<int, 3> &out) {
+    out = {0, 0, 0};
+    if (version_text == nullptr) {
+      return false;
+    }
+    int idx = 0;
+    int value = 0;
+    bool reading_number = false;
+    bool has_any_number = false;
+    for (const char *p = version_text; *p != '\0' && idx < 3; ++p) {
+      const unsigned char ch = static_cast<unsigned char>(*p);
+      if (std::isdigit(ch)) {
+        reading_number = true;
+        has_any_number = true;
+        value = value * 10 + static_cast<int>(ch - '0');
+      } else if (reading_number) {
+        out[idx++] = value;
+        value = 0;
+        reading_number = false;
+      }
+    }
+    if (reading_number && idx < 3) {
+      out[idx++] = value;
+    }
+    return has_any_number && idx > 0;
+  }
+
+  static bool is_version_less_than(const std::array<int, 3> &lhs, int maj,
+                                   int min, int patch) {
+    const std::array<int, 3> rhs = {maj, min, patch};
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      if (lhs[i] < rhs[i]) {
+        return true;
+      }
+      if (lhs[i] > rhs[i]) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  void warn_if_rknn_sdk_too_old() {
+    sdk_version_warning_.reset();
+    rknn_sdk_version sdk_version;
+    std::memset(&sdk_version, 0, sizeof(sdk_version));
+    const int ret = rknn_query(initial_ctx, RKNN_QUERY_SDK_VERSION,
+                               &sdk_version, sizeof(sdk_version));
+    if (ret < 0) {
+      return;
+    }
+
+    std::array<int, 3> parsed = {0, 0, 0};
+    if (!parse_version_triplet(sdk_version.api_version, parsed)) {
+      return;
+    }
+
+    if (is_version_less_than(parsed, 2, 3, 2)) {
+      sdk_version_warning_ = "RKNN API version " +
+                             std::string(sdk_version.api_version) +
+                             " is likely outdated; behavior may be "
+                             "unstable.";
+    }
+  }
+
   // 初始化：加载模型文件、初始化 RKNN 上下文并查询 IO 属性
   void init() {
 #ifdef TRACY_ENABLE
@@ -659,6 +730,7 @@ private:
       throw std::runtime_error("rknn_init failed with error code: " +
                                std::to_string(ret));
     }
+    warn_if_rknn_sdk_too_old();
     ret =
         rknn_query(initial_ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
     if (ret < 0) {
