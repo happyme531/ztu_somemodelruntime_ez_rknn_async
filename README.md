@@ -13,7 +13,7 @@
 | **Pipeline-based Async Inference** | ✅ Supported | ⚠️ Limited (Depth = 1) |
 | **True Async Inference (Callback/Future)** | ✅ Supported | ❌ Not Supported |
 | **Multi-batch Data Parallel Inference** | ✅ Supported | ⚠️ Limited (Fixed batch/4D only) |
-| **Custom Operator Plugins** | 🏗️ TODO | ❌ Not Supported |
+| **Custom Operator Plugins** | ✅ Supported | ❌ Not Supported |
 | **API Style** | 🚀 ORT-like (Easy migration) | ⚙️ Proprietary (Complex) |
 | **Zero Dependencies** | ✅ Yes (NumPy only) | ❌ No |
 | **Break Other Packages** | ✅ No | ⚠️ Yes (https://github.com/airockchip/rknn-toolkit2/issues/414) |

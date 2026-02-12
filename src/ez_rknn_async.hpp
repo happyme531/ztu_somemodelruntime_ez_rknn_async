@@ -49,6 +49,10 @@
 #include "tracy/Tracy.hpp"
 #endif
 
+#ifndef EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK
+#define EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK 0
+#endif
+
 #if __cplusplus < 201703L
 #error                                                                         \
     "C++17 or a later version is required to compile this class. Please use a C++17 compatible compiler and enable C++17 features (e.g., -std=c++17)."
@@ -105,16 +109,18 @@ public:
   // threadsPerCore：每个 NPU 核心上创建的工作线程数
   // sequentialCallbacks：是否按顺序调用回调函数（默认 false，不保证顺序）
   // schedule：指定 NPU 核心的调度顺序 (例如 {0, 1, 2} 或 {0, 0, 1})
+  // disableDupContext：为 true 时，不使用 rknn_dup_context，改为多次 rknn_init
   AsyncEzRknn(const std::filesystem::path &model_path,
               Layout layout = Layout::ORIGINAL, size_t maxQueueSize = 3,
               int threadsPerCore = 2, bool sequentialCallbacks = true,
               std::vector<uint64_t> schedule = {0, 1,
                                                 2}, // 默认使用 3 个核心轮询
-              bool enablePacing = false)
+              bool enablePacing = false, bool disableDupContext = false)
       : model_path_(model_path), layout_(layout), maxQueueSize_(maxQueueSize),
         threadsPerCore_(threadsPerCore), stopFlag(false), taskCounter(0),
         sequentialCallbacks_(sequentialCallbacks), nextSequentialTask(0),
-        schedule_(schedule), enablePacing_(enablePacing) {
+        schedule_(schedule), disableDupContext_(disableDupContext),
+        enablePacing_(enablePacing) {
     // 使用 Tracy 标记构造函数
 #ifdef TRACY_ENABLE
     ZoneScopedN("AsyncEzRknn::Constructor");
@@ -591,10 +597,13 @@ private:
   size_t maxQueueSize_;
   int threadsPerCore_;
   std::vector<uint64_t> schedule_;
+  bool disableDupContext_ = false;
 
   // RKNN 相关变量
   rknn_context initial_ctx = 0;
-  std::map<int, std::timed_mutex> coreMutexes_; // 修改: 使用 std::timed_mutex
+#if EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK
+  std::map<int, std::mutex> coreMutexes_; // 每个核心一个互斥锁，串行同核 rknn_run
+#endif
 
   // 线程池及任务队列
   std::vector<std::thread> workerThreads;
@@ -780,30 +789,38 @@ private:
     }
 
     // 初始化每个核心的互斥锁
+#if EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK
     for (uint64_t core : used_cores_vec) {
       coreMutexes_[static_cast<int>(core)]; // 为每个使用的核心创建一个互斥锁
     }
+#endif
 
     int totalThreads = threadsPerCore_ * used_cores.size();
     contexts.resize(totalThreads);
     contexts[0] = initial_ctx;
     for (int i = 1; i < totalThreads; i++) {
+      bool disable_dup_context = false;
 #if ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT
-      // 禁用 dup_context，使用 init 初始化每个 context
-      int ret =
-          rknn_init(&contexts[i], model_data.data(), model_size, 0, nullptr);
-      if (ret < 0) {
-        throw std::runtime_error("rknn_init failed with error code: " +
-                                 std::to_string(ret));
-      }
+      disable_dup_context = true;
 #else
-      // 使用 dup_context 复制初始 context
-      int ret = rknn_dup_context(&initial_ctx, &contexts[i]);
-      if (ret < 0) {
-        throw std::runtime_error("rknn_dup_context failed with error code: " +
-                                 std::to_string(ret));
-      }
+      disable_dup_context = disableDupContext_;
 #endif
+      if (disable_dup_context) {
+        // 禁用 dup_context，使用 init 初始化每个 context
+        int ret =
+            rknn_init(&contexts[i], model_data.data(), model_size, 0, nullptr);
+        if (ret < 0) {
+          throw std::runtime_error("rknn_init failed with error code: " +
+                                   std::to_string(ret));
+        }
+      } else {
+        // 使用 dup_context 复制初始 context
+        int ret = rknn_dup_context(&initial_ctx, &contexts[i]);
+        if (ret < 0) {
+          throw std::runtime_error("rknn_dup_context failed with error code: " +
+                                   std::to_string(ret));
+        }
+      }
     }
     for (int i = 0; i < totalThreads; i++) {
       int core = used_cores_vec[i % used_cores_vec.size()];
@@ -1043,37 +1060,22 @@ private:
           continue;
         }
 
-        // 3. 执行推理 (尝试加锁 5ms)
+        // 3. 执行推理
         int ret_run;
         {
-          // 获取当前任务对应核心的 timed_mutex
-          std::timed_mutex &currentCoreMutex = coreMutexes_.at(task.coreId);
-          std::unique_lock<std::timed_mutex> lock(
-              currentCoreMutex, std::defer_lock); // 准备 unique_lock
-#ifdef TRACY_ENABLE
-          ZoneScopedN("AttemptLockAndRunInference"); // 更新 Tracy Zone 名称
-                                                     // 添加核心 ID 信息 (可选)
-          // std::string lockMsg = "Attempting lock on core: " +
-          // std::to_string(task.coreId); ZoneText(lockMsg.c_str(),
-          // lockMsg.length());
+#if EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK
+          // 同一个 core 的推理串行化，避免并发运行
+          std::mutex &currentCoreMutex = coreMutexes_.at(task.coreId);
+          std::lock_guard<std::mutex> lock(currentCoreMutex);
 #endif
-          // // // 尝试获取锁
-          // lock.try_lock_for(std::chrono::milliseconds(
-          //     static_cast<int>(avg_proc_time_us_.load())));
-          // 成功获取锁
-          {
 #ifdef TRACY_ENABLE
-            // 标记持有锁并执行推理
-            ZoneScopedN("RunInference (Locked)");
+          ZoneScopedN("RunInference");
 #endif
-            // 在锁的作用域内执行 rknn_run
-            auto inference_start_time =
-                std::chrono::high_resolution_clock::now();
+          auto inference_start_time = std::chrono::high_resolution_clock::now();
             ret_run = rknn_run(ctx, nullptr);
             auto inference_end_time = std::chrono::high_resolution_clock::now();
             if (ret_run >= 0 && enablePacing_) {
-              auto proc_time_us =
-                  std::chrono::duration_cast<std::chrono::microseconds>(
+            auto proc_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
                       inference_end_time - inference_start_time)
                       .count();
               float current_avg = avg_proc_time_us_.load();
@@ -1081,16 +1083,13 @@ private:
                 avg_proc_time_us_.store(static_cast<float>(proc_time_us));
               } else {
                 avg_proc_time_us_.store(0.95f * current_avg +
-                                        0.05f *
-                                            static_cast<float>(proc_time_us));
+                                      0.05f * static_cast<float>(proc_time_us));
               }
 #ifdef TRACY_ENABLE
               TracyPlot("Current Proc Time (us)", proc_time_us);
 #endif
             }
-            // unique_lock 会在作用域结束时自动解锁
-          }
-        } // 结束尝试加锁和推理的作用域
+        } // 结束推理作用域
 
         if (ret_run < 0) {
 #ifdef TRACY_ENABLE
@@ -1184,14 +1183,21 @@ private:
   } // 结束 WorkerThreadFunc Zone
 
 #if ZTU_EZRKNN_ASYNC_HAS_CUSTOM_OP
+  bool is_dup_context_enabled() const {
+#if ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT
+    return false;
+#else
+    return !disableDupContext_;
+#endif
+  }
+
   void register_custom_op_for_all_contexts(GetCustomOpFunc custom_op_func) {
     if (custom_op_func == nullptr) {
       throw std::invalid_argument("custom_op_func is null");
     }
 
     // 检查是否需要警告：使用 dup_context 且总线程数大于 1
-#if !ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT
-    if (contexts.size() > 1) {
+    if (is_dup_context_enabled() && contexts.size() > 1) {
       std::cerr
           << "WARNING: Registering custom ops with dup_context and "
              "multiple threads (>1) may cause issues due to RKNN internal "
@@ -1199,7 +1205,6 @@ private:
              "to use rknn_init instead."
           << std::endl;
     }
-#endif
 
     bool registered = false;
     for (auto ctx : contexts) {

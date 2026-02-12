@@ -47,6 +47,9 @@ struct SessionConfig {
   bool sequential_callbacks = true;
   std::vector<uint64_t> schedule = {0};
   bool enable_pacing = false;
+  bool disable_dup_context = false;
+  std::vector<std::string> custom_op_paths;
+  bool custom_op_default_path = false;
 };
 
 template <typename T> std::shared_ptr<T> make_py_shared(T obj) {
@@ -256,6 +259,34 @@ std::vector<uint64_t> parse_schedule_like(py::handle value) {
   return schedule;
 }
 
+std::string parse_path_like(py::handle value, const char *name) {
+  try {
+    py::object path_obj = py::module_::import("os").attr("fspath")(value);
+    return py::cast<std::string>(path_obj);
+  } catch (...) {
+    throw std::runtime_error(std::string(name) +
+                             " must be a path-like object or string");
+  }
+}
+
+std::vector<std::string> parse_paths_like(py::handle value, const char *name) {
+  if (py::isinstance<py::str>(value) || py::hasattr(value, "__fspath__")) {
+    return {parse_path_like(value, name)};
+  }
+  if (py::isinstance<py::sequence>(value)) {
+    py::sequence seq = value.cast<py::sequence>();
+    std::vector<std::string> paths;
+    paths.reserve(seq.size());
+    for (auto item : seq) {
+      paths.push_back(parse_path_like(item, name));
+    }
+    return paths;
+  }
+  throw std::runtime_error(std::string(name) +
+                           " must be a path-like object or sequence of "
+                           "path-like objects");
+}
+
 py::dict extract_provider_options(const py::object &provider_options_obj) {
   if (provider_options_obj.is_none()) {
     return py::dict();
@@ -312,6 +343,21 @@ SessionConfig parse_session_config(const py::object &provider_options_obj) {
     }
     if (key == "enable_pacing") {
       config.enable_pacing = parse_bool_like(item.second, key.c_str());
+      continue;
+    }
+    if (key == "disable_dup_context") {
+      config.disable_dup_context = parse_bool_like(item.second, key.c_str());
+      continue;
+    }
+    if (key == "custom_op_path" || key == "custom_op_paths") {
+      auto parsed_paths = parse_paths_like(item.second, key.c_str());
+      config.custom_op_paths.insert(config.custom_op_paths.end(),
+                                    parsed_paths.begin(), parsed_paths.end());
+      continue;
+    }
+    if (key == "custom_op_default_path" ||
+        key == "load_custom_ops_from_default_path") {
+      config.custom_op_default_path = parse_bool_like(item.second, key.c_str());
       continue;
     }
   }
@@ -469,6 +515,17 @@ public:
   InferenceSession(const std::string &model_path, const SessionConfig &config)
       : pipeline_depth_(0), pipeline_initialized_(false),
         nchw_software_(false) {
+    const bool has_custom_op_request =
+        !config.custom_op_paths.empty() || config.custom_op_default_path;
+    const bool disable_dup_context =
+        config.disable_dup_context || has_custom_op_request;
+
+    if (has_custom_op_request) {
+      emit_python_user_warning(
+          "Custom op loading requested; dup_context is disabled for this "
+          "session to avoid known RKNN stability issues.");
+    }
+
     AsyncEzRknn::Layout layout_enum = AsyncEzRknn::Layout::ORIGINAL;
     std::string layout_lower = config.layout;
     for (auto &c : layout_lower) {
@@ -490,9 +547,16 @@ public:
 
     rknn_ = std::make_unique<AsyncEzRknn>(
         model_path, layout_enum, config.max_queue_size, config.threads_per_core,
-        config.sequential_callbacks, config.schedule, config.enable_pacing);
+        config.sequential_callbacks, config.schedule, config.enable_pacing,
+        disable_dup_context);
     if (rknn_->sdk_version_warning().has_value()) {
       emit_python_user_warning(rknn_->sdk_version_warning().value());
+    }
+    for (const auto &custom_op_path : config.custom_op_paths) {
+      rknn_->load_custom_op(custom_op_path);
+    }
+    if (config.custom_op_default_path) {
+      rknn_->load_custom_ops_from_default_path();
     }
 
     input_attrs_ = rknn_->input_attrs;
@@ -948,7 +1012,7 @@ PYBIND11_MODULE(_core, m) {
            py::arg("provider_options") = py::none(),
            "Create an inference session.\n\n"
            "ORT-style constructor. provider_options carries RKNN runtime "
-           "options.")
+           "options, including custom op loading settings.")
       .def("run", &InferenceSession::run, py::arg("output_names") = py::none(),
            py::arg("input_feed"), py::arg("run_options") = py::none(),
            "Run inference.\n\n"
@@ -976,5 +1040,5 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly("input_names", &InferenceSession::input_names)
       .def_property_readonly("output_names", &InferenceSession::output_names);
 
-  m.attr("__version__") = "0.2.0";
+  m.attr("__version__") = "0.3.0";
 }
