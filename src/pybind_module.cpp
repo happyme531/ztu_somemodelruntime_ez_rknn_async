@@ -360,6 +360,12 @@ SessionConfig parse_session_config(const py::object &provider_options_obj) {
       config.custom_op_default_path = parse_bool_like(item.second, key.c_str());
       continue;
     }
+    throw std::runtime_error(
+        "Unknown provider_options key: " + key +
+        ". Supported keys: layout, max_queue_size, threads_per_core, "
+        "sequential_callbacks, schedule, enable_pacing, disable_dup_context, "
+        "custom_op_path, custom_op_paths, custom_op_default_path, "
+        "load_custom_ops_from_default_path");
   }
   return config;
 }

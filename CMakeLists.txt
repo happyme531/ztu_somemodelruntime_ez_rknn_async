@@ -19,3 +19,8 @@ target_compile_definitions(_core PRIVATE PYBIND11_DETAILED_ERROR_MESSAGES=1)
 
 install(TARGETS _core LIBRARY DESTINATION ztu_somemodelruntime_ez_rknn_async)
 install(FILES python/ztu_somemodelruntime_ez_rknn_async/__init__.py DESTINATION ztu_somemodelruntime_ez_rknn_async)
+install(FILES
+  python/ztu_somemodelruntime_ez_rknn_async/options.py
+  python/ztu_somemodelruntime_ez_rknn_async/__init__.pyi
+  python/ztu_somemodelruntime_ez_rknn_async/py.typed
+  DESTINATION ztu_somemodelruntime_ez_rknn_async)
