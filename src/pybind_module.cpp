@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <chrono>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,9 @@
 namespace py = pybind11;
 
 namespace {
+
+constexpr auto kAsyncSubmitRetrySleep = std::chrono::milliseconds(1);
+constexpr auto kAsyncSubmitTimeout = std::chrono::seconds(10);
 using ztu::rk::AsyncEzRknn;
 
 struct ParsedInput {
@@ -637,30 +641,33 @@ public:
     auto indices_shared =
         std::make_shared<std::vector<size_t>>(std::move(output_indices));
 
-    submit_task_async_blocking(
-        std::move(inputs),
-        [cb_shared, user_data_shared, attrs_shared,
-         indices_shared](size_t, AsyncEzRknn::InferenceResult outputs) {
-          py::gil_scoped_acquire gil;
-          try {
-            if (outputs.empty()) {
-              (*cb_shared)(py::none(), *user_data_shared,
-                           py::str("Inference failed"));
-              return;
-            }
-            py::list result = build_outputs_by_indices(outputs, *attrs_shared,
-                                                       *indices_shared);
-            (*cb_shared)(result, *user_data_shared, py::str(""));
-          } catch (const py::error_already_set &e) {
-            PyErr_WriteUnraisable(e.value().ptr());
-          } catch (const std::exception &e) {
+    {
+      py::gil_scoped_release release;
+      submit_task_async_blocking(
+          std::move(inputs),
+          [cb_shared, user_data_shared, attrs_shared,
+           indices_shared](size_t, AsyncEzRknn::InferenceResult outputs) {
+            py::gil_scoped_acquire gil;
             try {
-              (*cb_shared)(py::none(), *user_data_shared, py::str(e.what()));
-            } catch (const py::error_already_set &e2) {
-              PyErr_WriteUnraisable(e2.value().ptr());
+              if (outputs.empty()) {
+                (*cb_shared)(py::none(), *user_data_shared,
+                             py::str("Inference failed"));
+                return;
+              }
+              py::list result = build_outputs_by_indices(outputs, *attrs_shared,
+                                                         *indices_shared);
+              (*cb_shared)(result, *user_data_shared, py::str(""));
+            } catch (const py::error_already_set &e) {
+              PyErr_WriteUnraisable(e.value().ptr());
+            } catch (const std::exception &e) {
+              try {
+                (*cb_shared)(py::none(), *user_data_shared, py::str(e.what()));
+              } catch (const py::error_already_set &e2) {
+                PyErr_WriteUnraisable(e2.value().ptr());
+              }
             }
-          }
-        });
+          });
+    }
     return py::none();
   }
 
@@ -804,12 +811,18 @@ private:
   void submit_task_async_blocking(std::vector<ParsedInput> inputs,
                                   AsyncEzRknn::InferenceCallback callback) {
     auto views = to_input_views(inputs);
+    const auto start = std::chrono::steady_clock::now();
     while (true) {
       auto submitted = rknn_->asyncInferenceDyn(callback, views);
       if (submitted.has_value()) {
         return;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (std::chrono::steady_clock::now() - start > kAsyncSubmitTimeout) {
+        throw std::runtime_error(
+            "run_async submit timed out: async queue/callback pipeline is "
+            "saturated");
+      }
+      std::this_thread::sleep_for(kAsyncSubmitRetrySleep);
     }
   }
 
@@ -835,7 +848,7 @@ private:
       if (submitted.has_value()) {
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::sleep_for(kAsyncSubmitRetrySleep);
     }
     return future;
   }
@@ -1046,5 +1059,5 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly("input_names", &InferenceSession::input_names)
       .def_property_readonly("output_names", &InferenceSession::output_names);
 
-  m.attr("__version__") = "0.3.0";
+  m.attr("__version__") = "0.3.2";
 }

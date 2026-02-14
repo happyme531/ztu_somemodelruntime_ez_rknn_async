@@ -7,7 +7,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "ztu_somemodelruntime_ez_rknn_async"
-version = "0.3.0"
+version = "0.3.2"
 description = "RKNN async inference Python bindings"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -45,4 +45,7 @@ sdist.include = ["src/**", "python/**", "CMakeLists.txt"]
 
 [tool.scikit-build.cmake]
 minimum-version = "3.18"
-build-type = "Release"
+build-type = "RelWithDebInfo"
+
+[tool.scikit-build.install]
+strip = false
