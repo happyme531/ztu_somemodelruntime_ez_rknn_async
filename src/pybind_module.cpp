@@ -6,7 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
-#include <chrono>
+#include <array>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -32,10 +32,13 @@ struct ParsedInput {
   rknn_tensor_type type;
   size_t bytes;
   const void *data;
+  uint32_t n_dims;
+  std::array<uint32_t, RKNN_MAX_DIMS> dims;
 };
 
 struct PendingResult {
-  std::future<AsyncEzRknn::InferenceResult> future;
+  std::future<std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>>
+      future;
 };
 
 struct NodeArgInfo {
@@ -95,33 +98,6 @@ rknn_tensor_type dtype_to_rknn(const py::dtype &dtype) {
     return RKNN_TENSOR_BOOL;
   }
   throw std::runtime_error("Unsupported numpy dtype for RKNN input");
-}
-
-size_t rknn_type_size(rknn_tensor_type type) {
-  switch (type) {
-  case RKNN_TENSOR_FLOAT32:
-    return sizeof(float);
-  case RKNN_TENSOR_FLOAT16:
-    return sizeof(uint16_t);
-  case RKNN_TENSOR_INT8:
-    return sizeof(int8_t);
-  case RKNN_TENSOR_UINT8:
-    return sizeof(uint8_t);
-  case RKNN_TENSOR_INT16:
-    return sizeof(int16_t);
-  case RKNN_TENSOR_UINT16:
-    return sizeof(uint16_t);
-  case RKNN_TENSOR_INT32:
-    return sizeof(int32_t);
-  case RKNN_TENSOR_UINT32:
-    return sizeof(uint32_t);
-  case RKNN_TENSOR_INT64:
-    return sizeof(int64_t);
-  case RKNN_TENSOR_BOOL:
-    return sizeof(bool);
-  default:
-    throw std::runtime_error("Unsupported rknn tensor type");
-  }
 }
 
 std::string rknn_type_to_onnx_str(rknn_tensor_type type) {
@@ -383,21 +359,34 @@ std::string resolve_model_path(const py::object &path_or_bytes) {
   return py::cast<std::string>(os_path);
 }
 
-ParsedInput parse_array(py::array array, size_t expected_elems,
+ParsedInput parse_array(py::array array, uint32_t expected_dims,
                         bool allow_batch) {
   if (!array) {
     throw std::runtime_error("Input must be a numpy array");
   }
   auto dtype = array.dtype();
   rknn_tensor_type type = dtype_to_rknn(dtype);
-  size_t elems = static_cast<size_t>(array.size());
-  if (!allow_batch && expected_elems != elems) {
-    throw std::runtime_error("Input element count mismatch: expected " +
-                             std::to_string(expected_elems) + ", got " +
-                             std::to_string(elems));
+  if (array.ndim() > RKNN_MAX_DIMS) {
+    throw std::runtime_error("Input rank is too large");
   }
-  return ParsedInput{array, type, static_cast<size_t>(array.nbytes()),
-                     array.data()};
+  if (expected_dims > 0 && static_cast<uint32_t>(array.ndim()) != expected_dims) {
+    throw std::runtime_error("Input rank mismatch: expected " +
+                             std::to_string(expected_dims) + ", got " +
+                             std::to_string(array.ndim()));
+  }
+  if (allow_batch && array.ndim() < 1) {
+    throw std::runtime_error("Batch input must have ndim >= 1");
+  }
+  std::array<uint32_t, RKNN_MAX_DIMS> dims = {};
+  for (ssize_t i = 0; i < array.ndim(); ++i) {
+    const ssize_t dim = array.shape(i);
+    if (dim < 0) {
+      throw std::runtime_error("Input shape contains negative dim");
+    }
+    dims[static_cast<size_t>(i)] = static_cast<uint32_t>(dim);
+  }
+  return ParsedInput{array, type, static_cast<size_t>(array.nbytes()), array.data(),
+                     static_cast<uint32_t>(array.ndim()), dims};
 }
 
 py::array make_output_array(const std::shared_ptr<float[]> &data,
@@ -616,8 +605,8 @@ public:
     if (dispatch_batch) {
       return run_batch(std::move(inputs), output_indices);
     }
-    auto outputs = run_sync(std::move(inputs));
-    return build_outputs(outputs, output_indices);
+    auto result = run_sync(std::move(inputs));
+    return build_outputs(result.first, result.second, output_indices);
   }
 
   py::none run_async(py::object output_names_obj, py::object input_feed,
@@ -636,8 +625,6 @@ public:
     auto inputs = parse_input_feed(input_feed, false);
     auto cb_shared = make_py_shared(callback.cast<py::function>());
     auto user_data_shared = make_py_shared(user_data);
-    auto attrs_shared =
-        std::make_shared<std::vector<rknn_tensor_attr>>(output_attrs_);
     auto indices_shared =
         std::make_shared<std::vector<size_t>>(std::move(output_indices));
 
@@ -645,8 +632,8 @@ public:
       py::gil_scoped_release release;
       submit_task_async_blocking(
           std::move(inputs),
-          [cb_shared, user_data_shared, attrs_shared,
-           indices_shared](size_t, AsyncEzRknn::InferenceResult outputs) {
+          [this, cb_shared, user_data_shared,
+           indices_shared](size_t task_id, AsyncEzRknn::InferenceResult outputs) {
             py::gil_scoped_acquire gil;
             try {
               if (outputs.empty()) {
@@ -654,8 +641,12 @@ public:
                              py::str("Inference failed"));
                 return;
               }
-              py::list result = build_outputs_by_indices(outputs, *attrs_shared,
-                                                         *indices_shared);
+              auto attrs = rknn_->takeTaskOutputAttrs(task_id);
+              if (attrs.empty()) {
+                attrs = output_attrs_;
+              }
+              py::list result =
+                  build_outputs_by_indices(outputs, attrs, *indices_shared);
               (*cb_shared)(result, *user_data_shared, py::str(""));
             } catch (const py::error_already_set &e) {
               PyErr_WriteUnraisable(e.value().ptr());
@@ -698,15 +689,16 @@ public:
     pipeline_queue_.pop();
     lock.unlock();
 
-    AsyncEzRknn::InferenceResult outputs;
+    std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>
+        result_pack;
     {
       py::gil_scoped_release release;
-      outputs = ready.future.get();
+      result_pack = ready.future.get();
     }
-    if (outputs.empty()) {
+    if (result_pack.first.empty()) {
       throw std::runtime_error("Inference failed");
     }
-    return outputs_to_python(outputs, output_attrs_);
+    return outputs_to_python(result_pack.first, result_pack.second);
   }
 
   std::vector<std::string> input_names() const { return input_names_; }
@@ -729,7 +721,7 @@ private:
                                  " inputs, but a single array was given");
       }
       py::array arr = ensure_array(input_feed, 0);
-      return {parse_array(arr, input_attrs_[0].n_elems, allow_batch)};
+      return {parse_array(arr, input_attrs_[0].n_dims, allow_batch)};
     }
 
     if (py::isinstance<py::dict>(input_feed)) {
@@ -747,8 +739,7 @@ private:
           throw std::runtime_error("Missing input: " + input_names_[i]);
         }
         py::array arr = ensure_array(d[key], i);
-        inputs.push_back(
-            parse_array(arr, input_attrs_[i].n_elems, allow_batch));
+        inputs.push_back(parse_array(arr, input_attrs_[i].n_dims, allow_batch));
       }
       return inputs;
     }
@@ -765,8 +756,7 @@ private:
       inputs.reserve(expected_inputs);
       for (size_t i = 0; i < expected_inputs; ++i) {
         py::array arr = ensure_array(seq[i], i);
-        inputs.push_back(
-            parse_array(arr, input_attrs_[i].n_elems, allow_batch));
+        inputs.push_back(parse_array(arr, input_attrs_[i].n_dims, allow_batch));
       }
       return inputs;
     }
@@ -803,7 +793,8 @@ private:
     std::vector<AsyncEzRknn::InputView> views;
     views.reserve(inputs.size());
     for (const auto &in : inputs) {
-      views.push_back(AsyncEzRknn::InputView{in.data, in.bytes, in.type});
+      views.push_back(
+          AsyncEzRknn::InputView{in.data, in.bytes, in.type, in.n_dims, in.dims});
     }
     return views;
   }
@@ -826,17 +817,23 @@ private:
     }
   }
 
-  std::future<AsyncEzRknn::InferenceResult>
+  std::future<std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>>
   submit_task_blocking(std::vector<ParsedInput> inputs) {
-    auto promise =
-        std::make_shared<std::promise<AsyncEzRknn::InferenceResult>>();
+    using ResultPack =
+        std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>;
+    auto promise = std::make_shared<std::promise<ResultPack>>();
     auto future = promise->get_future();
     auto views = to_input_views(inputs);
     while (true) {
       auto submitted = rknn_->asyncInferenceDyn(
-          [promise](size_t, AsyncEzRknn::InferenceResult outputs) {
+          [this, promise](size_t task_id, AsyncEzRknn::InferenceResult outputs) {
             try {
-              promise->set_value(std::move(outputs));
+              auto attrs = rknn_->takeTaskOutputAttrs(task_id);
+              if (attrs.empty()) {
+                attrs = output_attrs_;
+              }
+              promise->set_value(
+                  ResultPack{std::move(outputs), std::move(attrs)});
             } catch (...) {
               try {
                 promise->set_exception(std::current_exception());
@@ -853,24 +850,29 @@ private:
     return future;
   }
 
-  AsyncEzRknn::InferenceResult run_sync(std::vector<ParsedInput> inputs) {
+  std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>
+  run_sync(std::vector<ParsedInput> inputs) {
     auto future = submit_task_blocking(std::move(inputs));
     py::gil_scoped_release release;
-    auto outputs = future.get();
-    if (outputs.empty()) {
+    auto result = future.get();
+    if (result.first.empty()) {
       throw std::runtime_error("Inference failed");
     }
-    return outputs;
+    if (result.second.size() != output_attrs_.size()) {
+      throw std::runtime_error("Output attr count mismatch");
+    }
+    return result;
   }
 
   py::list build_outputs(const AsyncEzRknn::InferenceResult &outputs,
+                         const std::vector<rknn_tensor_attr> &attrs,
                          const std::vector<size_t> &indices) {
     py::list result;
     for (size_t idx : indices) {
-      if (idx >= outputs.size()) {
+      if (idx >= outputs.size() || idx >= attrs.size()) {
         throw std::runtime_error("Output index out of range");
       }
-      result.append(make_output_array(outputs[idx], output_attrs_[idx]));
+      result.append(make_output_array(outputs[idx], attrs[idx]));
     }
     return result;
   }
@@ -881,6 +883,7 @@ private:
       throw std::runtime_error("No inputs provided");
     }
     size_t batch = 0;
+    std::vector<size_t> sample_bytes(inputs.size(), 0);
     for (size_t i = 0; i < inputs.size(); ++i) {
       auto info = inputs[i].array.request();
       if (info.ndim < 1) {
@@ -894,21 +897,24 @@ private:
       }
 
       const auto &attr = input_attrs_[i];
-      if (attr.n_dims == 0 || attr.dims[0] != 1) {
+      if (attr.n_dims == 0 || (attr.dims[0] != 1 && attr.dims[0] != 0)) {
         throw std::runtime_error(
             "Batch mode requires model input batch dimension == 1");
       }
-
-      size_t per_sample_elems = attr.n_elems / attr.dims[0];
-      size_t expected_total_elems = per_sample_elems * batch;
-      size_t actual_total_elems = static_cast<size_t>(info.size);
-      if (actual_total_elems != expected_total_elems) {
-        throw std::runtime_error("Batch input size mismatch at input index " +
+      if (batch == 0) {
+        throw std::runtime_error("Batch size must be greater than 0");
+      }
+      const size_t total_bytes = static_cast<size_t>(inputs[i].bytes);
+      if (total_bytes % batch != 0) {
+        throw std::runtime_error("Batch input bytes mismatch at input index " +
                                  std::to_string(i));
       }
+      sample_bytes[i] = total_bytes / batch;
     }
 
-    std::vector<std::future<AsyncEzRknn::InferenceResult>> futures;
+    std::vector<
+        std::future<std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>>>
+        futures;
     futures.reserve(batch);
 
     for (size_t b = 0; b < batch; ++b) {
@@ -920,31 +926,56 @@ private:
         const char *base = static_cast<const char *>(info.ptr);
         const char *ptr = base + stride0 * b;
 
-        const auto &attr = input_attrs_[i];
-        size_t per_sample_elems = attr.n_elems / attr.dims[0];
-        size_t bytes = per_sample_elems * rknn_type_size(inputs[i].type);
-
-        ParsedInput one{inputs[i].array, inputs[i].type, bytes, ptr};
+        std::array<uint32_t, RKNN_MAX_DIMS> dims = inputs[i].dims;
+        if (inputs[i].n_dims == 0) {
+          throw std::runtime_error("Batch input rank must be >= 1");
+        }
+        dims[0] = 1;
+        ParsedInput one{inputs[i].array, inputs[i].type, sample_bytes[i], ptr,
+                        inputs[i].n_dims, dims};
         per_inputs.push_back(one);
       }
       futures.push_back(submit_task_blocking(std::move(per_inputs)));
     }
 
     std::vector<AsyncEzRknn::InferenceResult> batch_outputs;
+    std::vector<std::vector<rknn_tensor_attr>> batch_attrs;
     batch_outputs.resize(batch);
+    batch_attrs.resize(batch);
     {
       py::gil_scoped_release release;
       for (size_t b = 0; b < batch; ++b) {
-        batch_outputs[b] = futures[b].get();
+        auto one = futures[b].get();
+        batch_outputs[b] = std::move(one.first);
+        batch_attrs[b] = std::move(one.second);
         if (batch_outputs[b].empty()) {
           throw std::runtime_error("Inference failed in batch mode");
         }
       }
     }
 
+    if (batch_attrs.empty() || batch_attrs[0].size() != output_attrs_.size()) {
+      throw std::runtime_error("Invalid output attrs in batch mode");
+    }
+    for (size_t b = 1; b < batch_attrs.size(); ++b) {
+      if (batch_attrs[b].size() != batch_attrs[0].size()) {
+        throw std::runtime_error("Batch output attr count mismatch");
+      }
+      for (size_t i = 0; i < batch_attrs[b].size(); ++i) {
+        if (batch_attrs[b][i].n_dims != batch_attrs[0][i].n_dims) {
+          throw std::runtime_error("Batch output rank mismatch");
+        }
+        for (uint32_t d = 0; d < batch_attrs[b][i].n_dims; ++d) {
+          if (batch_attrs[b][i].dims[d] != batch_attrs[0][i].dims[d]) {
+            throw std::runtime_error("Batch output shape mismatch");
+          }
+        }
+      }
+    }
+
     py::list result;
     for (size_t out_idx : indices) {
-      const auto &attr = output_attrs_[out_idx];
+      const auto &attr = batch_attrs[0][out_idx];
       size_t per_sample_elems = attr.n_elems;
       std::vector<ssize_t> shape;
       if (attr.n_dims == 0) {
@@ -1059,5 +1090,5 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly("input_names", &InferenceSession::input_names)
       .def_property_readonly("output_names", &InferenceSession::output_names);
 
-  m.attr("__version__") = "0.3.2";
+  m.attr("__version__") = "0.4.0";
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rknn_api.h"
+#include <algorithm>
 #include <any>
 #include <array>
 #include <atomic>
@@ -100,6 +101,8 @@ public:
     const void *data = nullptr;
     size_t bytes = 0;
     rknn_tensor_type type = RKNN_TENSOR_FLOAT32;
+    uint32_t n_dims = 0;
+    std::array<uint32_t, RKNN_MAX_DIMS> dims = {};
   };
 
   // 构造函数
@@ -312,15 +315,23 @@ public:
     }
     std::vector<std::vector<uint8_t>> inputCopies;
     std::vector<rknn_tensor_type> inputTypes; // 存储输入类型
+    std::vector<Task::Shape> inputShapes;
     inputCopies.reserve(sizeof...(inputs));
     inputTypes.reserve(sizeof...(inputs));
+    inputShapes.reserve(sizeof...(inputs));
     storeAllInputs(inputCopies, inputTypes,
                    inputs...); // 拷贝输入数据并存储类型
+    for (size_t i = 0; i < input_attrs.size(); ++i) {
+      Task::Shape shape;
+      shape.n_dims = input_attrs[i].n_dims;
+      std::copy_n(input_attrs[i].dims, input_attrs[i].n_dims, shape.dims.begin());
+      inputShapes.push_back(shape);
+    }
 
     size_t taskId = taskCounter++;
     size_t coreId = schedule_[taskId % schedule_.size()];
     Task task{taskId, std::move(inputCopies), std::move(inputTypes),
-              std::move(callback), coreId};
+              std::move(inputShapes), std::move(callback), coreId};
 
     {
       std::lock_guard<std::mutex> lock(queueMutex);
@@ -392,15 +403,22 @@ public:
 
     std::vector<std::vector<uint8_t>> inputCopies;
     std::vector<rknn_tensor_type> inputTypes;
+    std::vector<Task::Shape> inputShapes;
     inputCopies.reserve(inputs.size());
     inputTypes.reserve(inputs.size());
+    inputShapes.reserve(inputs.size());
 
     for (size_t i = 0; i < inputs.size(); ++i) {
       if (inputs[i].data == nullptr) {
         throw std::runtime_error("Input data is null");
       }
-      size_t expected_bytes =
-          input_attrs[i].n_elems * rknnTypeSize(inputs[i].type);
+      if (inputs[i].n_dims > RKNN_MAX_DIMS) {
+        throw std::runtime_error("Input rank is too large at index " +
+                                 std::to_string(i));
+      }
+      const size_t expected_elems =
+          calcNumElements(inputs[i].dims.data(), inputs[i].n_dims);
+      const size_t expected_bytes = expected_elems * rknnTypeSize(inputs[i].type);
       if (inputs[i].bytes != expected_bytes) {
         throw std::runtime_error(
             "Input size mismatch at index " + std::to_string(i) +
@@ -411,12 +429,16 @@ public:
       std::memcpy(buf.data(), inputs[i].data, expected_bytes);
       inputCopies.push_back(std::move(buf));
       inputTypes.push_back(inputs[i].type);
+      Task::Shape shape;
+      shape.n_dims = inputs[i].n_dims;
+      std::copy_n(inputs[i].dims.begin(), inputs[i].n_dims, shape.dims.begin());
+      inputShapes.push_back(shape);
     }
 
     size_t taskId = taskCounter++;
     size_t coreId = schedule_[taskId % schedule_.size()];
     Task task{taskId, std::move(inputCopies), std::move(inputTypes),
-              std::move(callback), coreId};
+              std::move(inputShapes), std::move(callback), coreId};
 
     {
       std::lock_guard<std::mutex> lock(queueMutex);
@@ -573,6 +595,16 @@ public:
   const std::optional<std::string> &sdk_version_warning() const {
     return sdk_version_warning_;
   }
+  std::vector<rknn_tensor_attr> takeTaskOutputAttrs(size_t taskId) {
+    std::lock_guard<std::mutex> lock(taskOutputAttrsMutex_);
+    auto it = taskOutputAttrs_.find(taskId);
+    if (it == taskOutputAttrs_.end()) {
+      return {};
+    }
+    auto attrs = std::move(it->second);
+    taskOutputAttrs_.erase(it);
+    return attrs;
+  }
 
 private:
   // Pacing / Smoothing members
@@ -584,9 +616,14 @@ private:
 
   // 内部任务结构：存储任务 id、输入数据拷贝和回调函数
   struct Task {
+    struct Shape {
+      uint32_t n_dims = 0;
+      std::array<uint32_t, RKNN_MAX_DIMS> dims = {};
+    };
     size_t taskId;
     std::vector<std::vector<uint8_t>> inputs; // 每个输入数据拷贝
     std::vector<rknn_tensor_type> inputTypes; // 每个输入的类型
+    std::vector<Shape> inputShapes;           // 每个输入的 shape
     InferenceCallback callback;
     size_t coreId;
   };
@@ -598,6 +635,7 @@ private:
   int threadsPerCore_;
   std::vector<uint64_t> schedule_;
   bool disableDupContext_ = false;
+  bool isDynamicShapeModel_ = false;
 
   // RKNN 相关变量
   rknn_context initial_ctx = 0;
@@ -627,6 +665,8 @@ private:
   std::vector<void *> so_handles_;
 #endif
   std::optional<std::string> sdk_version_warning_;
+  std::mutex taskOutputAttrsMutex_;
+  std::map<size_t, std::vector<rknn_tensor_attr>> taskOutputAttrs_;
 
   // 修改后的 enqueueCallback 函数，直接添加回调，不阻塞等待
   void enqueueCallback(size_t taskId, std::function<void()> cb) {
@@ -678,6 +718,20 @@ private:
       out[idx++] = value;
     }
     return has_any_number && idx > 0;
+  }
+
+  bool detect_dynamic_shape_model(rknn_context ctx) const {
+    for (uint32_t i = 0; i < io_num.n_input; ++i) {
+      rknn_input_range range;
+      std::memset(&range, 0, sizeof(range));
+      range.index = i;
+      const int ret = rknn_query(ctx, RKNN_QUERY_INPUT_DYNAMIC_RANGE, &range,
+                                 sizeof(range));
+      if (ret >= 0 && range.shape_number > 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static bool is_version_less_than(const std::array<int, 3> &lhs, int maj,
@@ -777,6 +831,7 @@ private:
                                  std::to_string(i));
       }
     }
+    isDynamicShapeModel_ = detect_dynamic_shape_model(initial_ctx);
 
     // 根据 core_mask_ 和每个 NPU 核的线程数创建工作线程，并复制上下文
 #ifdef TRACY_ENABLE
@@ -1039,8 +1094,27 @@ private:
           }
         }
 
-        // 2. 设置输入数据
+        // 2. 根据当前任务输入动态设置 shape
         int ret;
+        std::vector<rknn_tensor_attr> currentInputAttrs = input_attrs;
+        for (size_t i = 0; i < currentInputAttrs.size(); ++i) {
+          currentInputAttrs[i].index = static_cast<uint32_t>(i);
+          currentInputAttrs[i].n_dims = task.inputShapes[i].n_dims;
+          std::fill(currentInputAttrs[i].dims,
+                    currentInputAttrs[i].dims + RKNN_MAX_DIMS, 0);
+          std::copy_n(task.inputShapes[i].dims.begin(), task.inputShapes[i].n_dims,
+                      currentInputAttrs[i].dims);
+        }
+        if (isDynamicShapeModel_) {
+          ret = rknn_set_input_shapes(ctx, io_num.n_input,
+                                      currentInputAttrs.data());
+          if (ret < 0) {
+            throw std::runtime_error("rknn_set_input_shapes Error: " +
+                                     std::to_string(ret));
+          }
+        }
+
+        // 3. 设置输入数据
         {
 #ifdef TRACY_ENABLE
           ZoneScopedN("SetInputs");
@@ -1101,6 +1175,26 @@ private:
           continue;
         }
 
+        std::vector<rknn_tensor_attr> currentOutputAttrs(io_num.n_output);
+        if (isDynamicShapeModel_) {
+          for (uint32_t i = 0; i < io_num.n_output; ++i) {
+            currentOutputAttrs[i].index = i;
+            ret = rknn_query(ctx, RKNN_QUERY_CURRENT_OUTPUT_ATTR,
+                             &currentOutputAttrs[i], sizeof(rknn_tensor_attr));
+            if (ret < 0) {
+              ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &currentOutputAttrs[i],
+                               sizeof(rknn_tensor_attr));
+              if (ret < 0) {
+                throw std::runtime_error(
+                    "Failed to query output attr for index " + std::to_string(i) +
+                    " with error code: " + std::to_string(ret));
+              }
+            }
+          }
+        } else {
+          currentOutputAttrs = output_attrs;
+        }
+
         // 4. 拷贝输出数据（使用 prealloc 模式避免拷贝）
         {
 #ifdef TRACY_ENABLE
@@ -1112,7 +1206,7 @@ private:
             outputs[i].index = i;
             outputs[i].want_float = true;
             outputs[i].is_prealloc = true; // 保持 prealloc
-            uint32_t num_elems = output_attrs[i].n_elems;
+            uint32_t num_elems = currentOutputAttrs[i].n_elems;
             uint32_t buf_size = num_elems * sizeof(float);
             // 注意：prealloc 模式下，需要确保分配的内存足够大
             float *buf =
@@ -1166,6 +1260,11 @@ private:
           // 但 rknn_outputs_release 仍然需要调用以释放 RKNN
           // 内部的一些资源（如果有的话）
           rknn_outputs_release(ctx, io_num.n_output, outputs.data());
+
+          {
+            std::lock_guard<std::mutex> lock(taskOutputAttrsMutex_);
+            taskOutputAttrs_[task.taskId] = currentOutputAttrs;
+          }
 
           // 输出数据已经通过 outputResults 的智能指针管理，直接移交即可
           enqueueCallback(task.taskId,
@@ -1283,6 +1382,17 @@ private:
     default:
       throw std::runtime_error("Unsupported rknn tensor type");
     }
+  }
+
+  static size_t calcNumElements(const uint32_t *dims, uint32_t n_dims) {
+    if (n_dims == 0) {
+      return 1;
+    }
+    size_t elems = 1;
+    for (uint32_t i = 0; i < n_dims; ++i) {
+      elems *= static_cast<size_t>(dims[i]);
+    }
+    return elems;
   }
 };
 
