@@ -111,18 +111,22 @@ public:
   // maxQueueSize：输入任务队列的最大个数（超过时不创建新任务）
   // threadsPerCore：每个 NPU 核心上创建的工作线程数
   // sequentialCallbacks：是否按顺序调用回调函数（默认 false，不保证顺序）
-  // schedule：指定 NPU 核心的调度顺序 (例如 {0, 1, 2} 或 {0, 0, 1})
+  // schedule：指定 NPU 核心的调度顺序 (例如 {0, 1, 2} 或 {0, 0, 1})。
+  //           若未设置，则使用 tpCoreMask 模式（默认 RKNN_NPU_CORE_AUTO）。
   // disableDupContext：为 true 时，不使用 rknn_dup_context，改为多次 rknn_init
   AsyncEzRknn(const std::filesystem::path &model_path,
               Layout layout = Layout::ORIGINAL, size_t maxQueueSize = 3,
               int threadsPerCore = 2, bool sequentialCallbacks = true,
-              std::vector<uint64_t> schedule = {0, 1,
-                                                2}, // 默认使用 3 个核心轮询
+              std::optional<std::vector<uint64_t>> schedule = std::nullopt,
+              std::optional<rknn_core_mask> tpCoreMask = RKNN_NPU_CORE_AUTO,
               bool enablePacing = false, bool disableDupContext = false)
       : model_path_(model_path), layout_(layout), maxQueueSize_(maxQueueSize),
         threadsPerCore_(threadsPerCore), stopFlag(false), taskCounter(0),
         sequentialCallbacks_(sequentialCallbacks), nextSequentialTask(0),
-        schedule_(schedule), disableDupContext_(disableDupContext),
+        schedule_(schedule.value_or(std::vector<uint64_t>{0})),
+        useScheduleMask_(schedule.has_value()),
+        tpCoreMask_(tpCoreMask.value_or(RKNN_NPU_CORE_AUTO)),
+        disableDupContext_(disableDupContext),
         enablePacing_(enablePacing) {
     // 使用 Tracy 标记构造函数
 #ifdef TRACY_ENABLE
@@ -132,7 +136,7 @@ public:
 #endif
     // Pacer 初始化
     if (enablePacing_) {
-      std::set<uint64_t> used_cores(schedule.begin(), schedule.end());
+      std::set<uint64_t> used_cores(schedule_.begin(), schedule_.end());
       num_cores_ = used_cores.size();
       last_accepted_time_ = std::chrono::high_resolution_clock::now();
     }
@@ -630,10 +634,13 @@ private:
 
   // 成员变量
   std::filesystem::path model_path_;
+  std::vector<uint8_t> model_data_;
   Layout layout_;
   size_t maxQueueSize_;
   int threadsPerCore_;
   std::vector<uint64_t> schedule_;
+  bool useScheduleMask_ = true;
+  rknn_core_mask tpCoreMask_ = RKNN_NPU_CORE_AUTO;
   bool disableDupContext_ = false;
   bool isDynamicShapeModel_ = false;
 
@@ -776,17 +783,17 @@ private:
 #ifdef TRACY_ENABLE
     ZoneScopedN("AsyncEzRknn::init");
 #endif
-    std::ifstream file(model_path_, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-      throw std::runtime_error("Failed to open model file: " +
-                               model_path_.string());
-    }
+      std::ifstream file(model_path_, std::ios::binary | std::ios::ate);
+      if (!file.is_open()) {
+        throw std::runtime_error("Failed to open model file: " +
+                                 model_path_.string());
+      }
     size_t model_size = file.tellg();
-    file.seekg(0, std::ios::beg);
+      file.seekg(0, std::ios::beg);
     std::vector<uint8_t> model_data(model_size);
     if (!file.read(reinterpret_cast<char *>(model_data.data()), model_size)) {
-      throw std::runtime_error("Failed to read model file");
-    }
+        throw std::runtime_error("Failed to read model file");
+      }
     int ret =
         rknn_init(&initial_ctx, model_data.data(), model_size, 0, nullptr);
     if (ret < 0) {
@@ -833,24 +840,29 @@ private:
     }
     isDynamicShapeModel_ = detect_dynamic_shape_model(initial_ctx);
 
-    // 根据 core_mask_ 和每个 NPU 核的线程数创建工作线程，并复制上下文
+    // 根据 schedule 或 tpCoreMask 创建工作线程，并复制上下文
 #ifdef TRACY_ENABLE
     ZoneScopedN("AsyncEzRknn::startWorkerThreads");
 #endif
-    std::set<uint64_t> used_cores(schedule_.begin(), schedule_.end());
-    std::vector<uint64_t> used_cores_vec(used_cores.begin(), used_cores.end());
-    if (used_cores_vec.empty()) {
-      throw std::runtime_error("No NPU core selected");
+    std::vector<uint64_t> worker_routes;
+    if (useScheduleMask_) {
+      std::set<uint64_t> used_cores(schedule_.begin(), schedule_.end());
+      worker_routes.assign(used_cores.begin(), used_cores.end());
+      if (worker_routes.empty()) {
+        throw std::runtime_error("No NPU core selected");
+      }
+    } else {
+      worker_routes = {0};
     }
 
     // 初始化每个核心的互斥锁
 #if EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK
-    for (uint64_t core : used_cores_vec) {
+    for (uint64_t core : worker_routes) {
       coreMutexes_[static_cast<int>(core)]; // 为每个使用的核心创建一个互斥锁
     }
 #endif
 
-    int totalThreads = threadsPerCore_ * used_cores.size();
+    int totalThreads = threadsPerCore_ * static_cast<int>(worker_routes.size());
     contexts.resize(totalThreads);
     contexts[0] = initial_ctx;
     for (int i = 1; i < totalThreads; i++) {
@@ -878,9 +890,12 @@ private:
       }
     }
     for (int i = 0; i < totalThreads; i++) {
-      int core = used_cores_vec[i % used_cores_vec.size()];
-      int ret = rknn_set_core_mask(contexts[i],
-                                   static_cast<rknn_core_mask>(1 << core));
+      int core = static_cast<int>(worker_routes[i % worker_routes.size()]);
+      rknn_core_mask core_mask = tpCoreMask_;
+      if (useScheduleMask_) {
+        core_mask = static_cast<rknn_core_mask>(1 << core);
+      }
+      int ret = rknn_set_core_mask(contexts[i], core_mask);
       if (ret < 0) {
         throw std::runtime_error("rknn_set_core_mask failed for thread " +
                                  std::to_string(i) +
@@ -1138,9 +1153,12 @@ private:
         int ret_run;
         {
 #if EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK
-          // 同一个 core 的推理串行化，避免并发运行
-          std::mutex &currentCoreMutex = coreMutexes_.at(task.coreId);
-          std::lock_guard<std::mutex> lock(currentCoreMutex);
+          // schedule 模式下同 core 串行化；tpCoreMask 模式允许多 context 并发运行
+          std::optional<std::lock_guard<std::mutex>> coreLock;
+          if (useScheduleMask_) {
+            std::mutex &currentCoreMutex = coreMutexes_.at(task.coreId);
+            coreLock.emplace(currentCoreMutex);
+          }
 #endif
 #ifdef TRACY_ENABLE
           ZoneScopedN("RunInference");

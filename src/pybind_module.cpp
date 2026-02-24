@@ -10,6 +10,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <string>
@@ -52,7 +53,8 @@ struct SessionConfig {
   size_t max_queue_size = 3;
   int threads_per_core = 1;
   bool sequential_callbacks = true;
-  std::vector<uint64_t> schedule = {0};
+  std::optional<std::vector<uint64_t>> schedule;
+  std::optional<rknn_core_mask> tp_core_mask;
   bool enable_pacing = false;
   bool disable_dup_context = false;
   std::vector<std::string> custom_op_paths;
@@ -239,6 +241,43 @@ std::vector<uint64_t> parse_schedule_like(py::handle value) {
   return schedule;
 }
 
+rknn_core_mask parse_tp_mode_like(py::handle value) {
+  if (!py::isinstance<py::str>(value)) {
+    throw std::runtime_error("tp_mode must be a string");
+  }
+
+  std::string text = trim_string(py::cast<std::string>(value));
+  for (auto &c : text) {
+    c = static_cast<char>(::tolower(c));
+  }
+
+  if (text == "auto") {
+    return RKNN_NPU_CORE_AUTO;
+  }
+  if (text == "all") {
+    return RKNN_NPU_CORE_ALL;
+  }
+  if (text == "0") {
+    return RKNN_NPU_CORE_0;
+  }
+  if (text == "1") {
+    return RKNN_NPU_CORE_1;
+  }
+  if (text == "2") {
+    return RKNN_NPU_CORE_2;
+  }
+  if (text == "0,1") {
+    return RKNN_NPU_CORE_0_1;
+  }
+  if (text == "0,1,2") {
+    return RKNN_NPU_CORE_0_1_2;
+  }
+
+  throw std::runtime_error(
+      "invalid tp_mode: '" + text +
+      "', expected one of: auto, all, 0, 1, 2, 0,1, 0,1,2");
+}
+
 std::string parse_path_like(py::handle value, const char *name) {
   try {
     py::object path_obj = py::module_::import("os").attr("fspath")(value);
@@ -291,6 +330,8 @@ py::dict extract_provider_options(const py::object &provider_options_obj) {
 SessionConfig parse_session_config(const py::object &provider_options_obj) {
   SessionConfig config;
   py::dict opts = extract_provider_options(provider_options_obj);
+  bool has_schedule = false;
+  bool has_tp_mode = false;
   for (auto item : opts) {
     std::string key = py::cast<std::string>(item.first);
     if (key == "layout") {
@@ -319,6 +360,12 @@ SessionConfig parse_session_config(const py::object &provider_options_obj) {
     }
     if (key == "schedule") {
       config.schedule = parse_schedule_like(item.second);
+      has_schedule = true;
+      continue;
+    }
+    if (key == "tp_mode") {
+      config.tp_core_mask = parse_tp_mode_like(item.second);
+      has_tp_mode = true;
       continue;
     }
     if (key == "enable_pacing") {
@@ -343,9 +390,17 @@ SessionConfig parse_session_config(const py::object &provider_options_obj) {
     throw std::runtime_error(
         "Unknown provider_options key: " + key +
         ". Supported keys: layout, max_queue_size, threads_per_core, "
-        "sequential_callbacks, schedule, enable_pacing, disable_dup_context, "
-        "custom_op_path, custom_op_paths, custom_op_default_path, "
+        "sequential_callbacks, schedule, tp_mode, enable_pacing, "
+        "disable_dup_context, custom_op_path, custom_op_paths, "
+        "custom_op_default_path, "
         "load_custom_ops_from_default_path");
+  }
+  if (has_schedule && has_tp_mode) {
+    throw std::runtime_error(
+        "provider_options 'tp_mode' conflicts with 'schedule'; set only one.");
+  }
+  if (!has_schedule && !has_tp_mode) {
+    config.tp_core_mask = RKNN_NPU_CORE_AUTO;
   }
   return config;
 }
@@ -546,8 +601,8 @@ public:
 
     rknn_ = std::make_unique<AsyncEzRknn>(
         model_path, layout_enum, config.max_queue_size, config.threads_per_core,
-        config.sequential_callbacks, config.schedule, config.enable_pacing,
-        disable_dup_context);
+        config.sequential_callbacks, config.schedule, config.tp_core_mask,
+        config.enable_pacing, disable_dup_context);
     if (rknn_->sdk_version_warning().has_value()) {
       emit_python_user_warning(rknn_->sdk_version_warning().value());
     }
@@ -1090,5 +1145,5 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly("input_names", &InferenceSession::input_names)
       .def_property_readonly("output_names", &InferenceSession::output_names);
 
-  m.attr("__version__") = "0.4.0";
+  m.attr("__version__") = "0.5.0";
 }

@@ -5,6 +5,7 @@ from typing import Literal, Sequence, TypedDict, Union
 
 PathLikeStr = Union[str, PathLike[str]]
 ScheduleLike = Union[int, str, Sequence[int]]
+TpModeLike = Literal["auto", "all", "0", "1", "2", "0,1", "0,1,2"]
 LayoutLike = Literal[
     "nchw",
     "original",
@@ -30,6 +31,7 @@ class RknnProviderOptions(TypedDict, total=False):
     threads_per_core: int
     sequential_callbacks: bool
     schedule: ScheduleLike
+    tp_mode: TpModeLike
     enable_pacing: bool
     disable_dup_context: bool
     custom_op_path: Union[PathLikeStr, Sequence[PathLikeStr]]
@@ -44,7 +46,8 @@ def make_provider_options(
     max_queue_size: int = 3,
     threads_per_core: int = 1,
     sequential_callbacks: bool = True,
-    schedule: ScheduleLike = (0,),
+    schedule: Union[ScheduleLike, None] = None,
+    tp_mode: Union[TpModeLike, None] = None,
     enable_pacing: bool = False,
     disable_dup_context: bool = False,
     custom_op_paths: Union[PathLikeStr, Sequence[PathLikeStr], None] = None,
@@ -60,8 +63,11 @@ def make_provider_options(
             ``> 0``.
         sequential_callbacks: If True, async callbacks are emitted in submit
             order.
-        schedule: Core schedule. Accepts int, string (e.g. ``"0,1,2"``), or
-            sequence of ints.
+        schedule: Core schedule (data-parallel mode). Accepts int, string
+            (e.g. ``"0,1,2"``), or sequence of ints.
+        tp_mode: Tensor-parallel core-mask mode. Supported values are
+            ``"auto"``, ``"all"``, ``"0"``, ``"1"``, ``"2"``,
+            ``"0,1"``, and ``"0,1,2"``.
         enable_pacing: Enable input pacing based on recent throughput.
         disable_dup_context: If True, avoid ``rknn_dup_context`` and initialize
             each worker context independently.
@@ -72,19 +78,26 @@ def make_provider_options(
         A ``dict`` suitable for ``provider_options``.
 
     Notes:
+        ``schedule`` and ``tp_mode`` are mutually exclusive.
         Requesting custom-op loading will force disable-dup-context behavior in
         runtime even if ``disable_dup_context`` is False.
     """
+    if schedule is not None and tp_mode is not None:
+        raise ValueError("provider options 'tp_mode' conflicts with 'schedule'; set only one.")
+
     options: RknnProviderOptions = {
         "layout": layout,
         "max_queue_size": max_queue_size,
         "threads_per_core": threads_per_core,
         "sequential_callbacks": sequential_callbacks,
-        "schedule": schedule,
         "enable_pacing": enable_pacing,
         "disable_dup_context": disable_dup_context,
         "custom_op_default_path": custom_op_default_path,
     }
+    if schedule is not None:
+        options["schedule"] = schedule
+    if tp_mode is not None:
+        options["tp_mode"] = tp_mode
     if custom_op_paths is not None:
         options["custom_op_paths"] = custom_op_paths
     return options

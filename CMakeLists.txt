@@ -5,11 +5,18 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+if(CMAKE_BUILD_TYPE MATCHES "Release")
+    add_compile_options(-g1 -O3 -fno-omit-frame-pointer)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
+endif()
+
+set(PYBIND11_STRIP OFF CACHE BOOL "Keep symbols in release for debugging" FORCE)
+
 find_package(pybind11 CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 find_library(RKNNRT_LIBRARY NAMES rknnrt REQUIRED)
 
-pybind11_add_module(_core src/pybind_module.cpp)
+pybind11_add_module(_core NO_EXTRAS src/pybind_module.cpp)
 
 target_include_directories(_core PRIVATE ${CMAKE_SOURCE_DIR}/src)
 

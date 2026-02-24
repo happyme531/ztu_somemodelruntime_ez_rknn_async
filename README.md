@@ -8,7 +8,7 @@
 | Feature | This Project | Official SDK |
 | :--- | :---: | :---: |
 | **Model Loading & Basic Inference** | ✅ Supported | ✅ Supported |
-| **Multi-core Tensor Parallel Inference** | ❌ Not Planned | ✅ Supported |
+| **Multi-core Tensor Parallel Inference** | ✅ Supported | ✅ Supported |
 | **Multi-core Data Parallel Inference** | ✅ Supported | ❌ Not Supported |
 | **Pipeline-based Async Inference** | ✅ Supported | ⚠️ Limited (Depth = 1) |
 | **True Async Inference (Callback/Future)** | ✅ Supported | ❌ Not Supported |
