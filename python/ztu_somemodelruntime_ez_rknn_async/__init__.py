@@ -9,4 +9,4 @@ __all__ = [
     "RknnProviderOptions",
     "make_provider_options",
 ]
-__version__ = "0.5.0"
+__version__ = "0.5.1"

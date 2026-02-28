@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence, Union
 
 from .options import RknnProviderOptions, make_provider_options
 
@@ -23,7 +23,7 @@ class InferenceSession:
         sess_options: Any = ...,
         providers: Any = ...,
         provider_options: Optional[
-            Sequence[RknnProviderOptions] | RknnProviderOptions
+            Union[Sequence[RknnProviderOptions], RknnProviderOptions]
         ] = ...,
         **kwargs: Any,
     ) -> None: ...
@@ -55,4 +55,4 @@ class InferenceSession:
     def output_names(self) -> List[str]: ...
 
 
-__all__: list[str]
+__all__: List[str]

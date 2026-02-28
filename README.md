@@ -1,6 +1,8 @@
 # ztu_somemodelruntime_ez_rknn_async
 ### A better RKNPU2 python API
 
+Supported Python versions: 3.7+
+
 --------
 
 ## 🚀 Feature Comparison

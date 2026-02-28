@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from os import PathLike
-from typing import Literal, Sequence, TypedDict, Union
+from typing import Sequence, TypedDict, Union
+
+try:
+    from typing import Literal
+except ImportError:  # pragma: no cover - Python 3.7 fallback
+    from typing_extensions import Literal
 
 PathLikeStr = Union[str, PathLike[str]]
 ScheduleLike = Union[int, str, Sequence[int]]

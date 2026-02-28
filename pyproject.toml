@@ -1,19 +1,22 @@
 [build-system]
 requires = [
-  "scikit-build-core>=0.7",
+  "scikit-build-core>=0.5,<0.8; python_version < '3.8'",
+  "scikit-build-core>=0.7; python_version >= '3.8'",
   "pybind11>=2.10",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "ztu_somemodelruntime_ez_rknn_async"
-version = "0.5.0"
+version = "0.5.1"
 description = "RKNN async inference Python bindings"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.8"
+requires-python = ">=3.7"
 dependencies = [
-  "numpy>=1.21",
+  "numpy>=1.21,<1.22; python_version < '3.8'",
+  "numpy>=1.21; python_version >= '3.8'",
+  "typing_extensions>=4.0; python_version < '3.8'",
 ]
 authors = [
   { name="hallo1", email="happyme5315@gmail.com" },
@@ -24,6 +27,7 @@ classifiers = [
   "License :: OSI Approved :: GNU Affero General Public License v3",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.7",
   "Programming Language :: Python :: 3.8",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
