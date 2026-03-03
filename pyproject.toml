@@ -46,6 +46,7 @@ classifiers = [
 [tool.scikit-build]
 wheel.packages = ["python/ztu_somemodelruntime_ez_rknn_async"]
 sdist.include = ["src/**", "python/**", "CMakeLists.txt"]
+sdist.exclude = ["dist/**", "wheelhouse/**", "*.whl", "*.tar.gz"]
 
 [tool.scikit-build.cmake]
 minimum-version = "3.18"
