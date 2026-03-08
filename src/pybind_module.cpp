@@ -24,8 +24,7 @@ namespace py = pybind11;
 
 namespace {
 
-constexpr auto kAsyncSubmitRetrySleep = std::chrono::milliseconds(1);
-constexpr auto kAsyncSubmitTimeout = std::chrono::seconds(10);
+constexpr int64_t kDefaultSubmitTimeoutMs = 10000;
 using ztu::rk::AsyncEzRknn;
 
 struct ParsedInput {
@@ -52,6 +51,7 @@ struct SessionConfig {
   std::string layout = "nchw_software";
   size_t max_queue_size = 3;
   int threads_per_core = 1;
+  int64_t submit_timeout_ms = kDefaultSubmitTimeoutMs;
   bool sequential_callbacks = true;
   std::optional<std::vector<uint64_t>> schedule;
   std::optional<rknn_core_mask> tp_core_mask;
@@ -354,6 +354,14 @@ SessionConfig parse_session_config(const py::object &provider_options_obj) {
       config.threads_per_core = static_cast<int>(value);
       continue;
     }
+    if (key == "submit_timeout_ms") {
+      int64_t value = parse_int_like(item.second, "submit_timeout_ms");
+      if (value <= 0) {
+        throw std::runtime_error("submit_timeout_ms must be > 0");
+      }
+      config.submit_timeout_ms = value;
+      continue;
+    }
     if (key == "sequential_callbacks") {
       config.sequential_callbacks = parse_bool_like(item.second, key.c_str());
       continue;
@@ -390,6 +398,7 @@ SessionConfig parse_session_config(const py::object &provider_options_obj) {
     throw std::runtime_error(
         "Unknown provider_options key: " + key +
         ". Supported keys: layout, max_queue_size, threads_per_core, "
+        "submit_timeout_ms, "
         "sequential_callbacks, schedule, tp_mode, enable_pacing, "
         "disable_dup_context, custom_op_path, custom_op_paths, "
         "custom_op_default_path, "
@@ -568,7 +577,8 @@ public:
 
   InferenceSession(const std::string &model_path, const SessionConfig &config)
       : pipeline_depth_(0), pipeline_initialized_(false),
-        nchw_software_(false) {
+        nchw_software_(false),
+        submit_timeout_(std::chrono::milliseconds(config.submit_timeout_ms)) {
     const bool has_custom_op_request =
         !config.custom_op_paths.empty() || config.custom_op_default_path;
     const bool disable_dup_context =
@@ -678,6 +688,7 @@ public:
     auto output_indices =
         resolve_output_indices(output_names_obj, output_names_);
     auto inputs = parse_input_feed(input_feed, false);
+    auto views = to_input_views(inputs);
     auto cb_shared = make_py_shared(callback.cast<py::function>());
     auto user_data_shared = make_py_shared(user_data);
     auto indices_shared =
@@ -686,7 +697,7 @@ public:
     {
       py::gil_scoped_release release;
       submit_task_async_blocking(
-          std::move(inputs),
+          views,
           [this, cb_shared, user_data_shared,
            indices_shared](size_t task_id, AsyncEzRknn::InferenceResult outputs) {
             py::gil_scoped_acquire gil;
@@ -723,8 +734,9 @@ public:
     }
 
     auto inputs = parse_input_feed(input_feed, false);
+    auto views = to_input_views(inputs);
     PendingResult pending;
-    pending.future = submit_task_blocking(std::move(inputs));
+    pending.future = submit_task_blocking(views);
 
     std::unique_lock<std::mutex> lock(pipeline_mutex_);
     if (!pipeline_initialized_ || reset || depth != pipeline_depth_) {
@@ -854,31 +866,30 @@ private:
     return views;
   }
 
-  void submit_task_async_blocking(std::vector<ParsedInput> inputs,
-                                  AsyncEzRknn::InferenceCallback callback) {
-    auto views = to_input_views(inputs);
-    const auto start = std::chrono::steady_clock::now();
+  void submit_task_async_blocking(
+      const std::vector<AsyncEzRknn::InputView> &views,
+      AsyncEzRknn::InferenceCallback callback) {
+    const auto deadline = std::chrono::steady_clock::now() + submit_timeout_;
     while (true) {
       auto submitted = rknn_->asyncInferenceDyn(callback, views);
       if (submitted.has_value()) {
         return;
       }
-      if (std::chrono::steady_clock::now() - start > kAsyncSubmitTimeout) {
+      if (!rknn_->wait_for_submit_capacity_until(deadline)) {
         throw std::runtime_error(
             "run_async submit timed out: async queue/callback pipeline is "
             "saturated");
       }
-      std::this_thread::sleep_for(kAsyncSubmitRetrySleep);
     }
   }
 
   std::future<std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>>
-  submit_task_blocking(std::vector<ParsedInput> inputs) {
+  submit_task_blocking(const std::vector<AsyncEzRknn::InputView> &views) {
     using ResultPack =
         std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>;
     auto promise = std::make_shared<std::promise<ResultPack>>();
     auto future = promise->get_future();
-    auto views = to_input_views(inputs);
+    const auto deadline = std::chrono::steady_clock::now() + submit_timeout_;
     while (true) {
       auto submitted = rknn_->asyncInferenceDyn(
           [this, promise](size_t task_id, AsyncEzRknn::InferenceResult outputs) {
@@ -900,14 +911,19 @@ private:
       if (submitted.has_value()) {
         break;
       }
-      std::this_thread::sleep_for(kAsyncSubmitRetrySleep);
+      if (!rknn_->wait_for_submit_capacity_until(deadline)) {
+        throw std::runtime_error(
+            "run submit timed out: async queue/callback pipeline is "
+            "saturated");
+      }
     }
     return future;
   }
 
   std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>
   run_sync(std::vector<ParsedInput> inputs) {
-    auto future = submit_task_blocking(std::move(inputs));
+    auto views = to_input_views(inputs);
+    auto future = submit_task_blocking(views);
     py::gil_scoped_release release;
     auto result = future.get();
     if (result.first.empty()) {
@@ -990,7 +1006,8 @@ private:
                         inputs[i].n_dims, dims};
         per_inputs.push_back(one);
       }
-      futures.push_back(submit_task_blocking(std::move(per_inputs)));
+      auto per_views = to_input_views(per_inputs);
+      futures.push_back(submit_task_blocking(per_views));
     }
 
     std::vector<AsyncEzRknn::InferenceResult> batch_outputs;
@@ -1080,6 +1097,7 @@ private:
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
   bool nchw_software_;
+  std::chrono::milliseconds submit_timeout_;
 
   size_t pipeline_depth_;
   bool pipeline_initialized_;

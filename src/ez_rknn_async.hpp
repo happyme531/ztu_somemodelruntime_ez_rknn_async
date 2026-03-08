@@ -154,6 +154,7 @@ public:
     stopFlag = true;
     queueCond.notify_all();
     callbackCond.notify_all();
+    submitWaitCond_.notify_all();
     for (auto &thread : workerThreads) {
       if (thread.joinable())
         thread.join();
@@ -455,6 +456,14 @@ public:
     return taskId;
   }
 
+  bool wait_for_submit_capacity_until(
+      const std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lock(submitWaitMutex_);
+    return submitWaitCond_.wait_until(lock, deadline, [this] {
+      return stopFlag.load() || has_submit_capacity_locked();
+    });
+  }
+
   // 伪同步流水线推理器：单线程使用，每次调用提交一个新任务并在填满延迟后返回旧结果
   class PipelineRunner {
   public:
@@ -664,6 +673,8 @@ private:
   std::queue<std::function<void()>> callbackQueue;
   std::thread callbackThread;
   static constexpr size_t MAX_CALLBACK_QUEUE_SIZE = 8;
+  std::mutex submitWaitMutex_;
+  std::condition_variable submitWaitCond_;
   // 新增顺序回调相关成员
   bool sequentialCallbacks_ = false;
   size_t nextSequentialTask = 0;
@@ -697,6 +708,17 @@ private:
 #endif
     }
     callbackCond.notify_all();
+  }
+
+  bool has_submit_capacity_locked() {
+    std::scoped_lock<std::mutex, std::mutex> lock(queueMutex, callbackMutex);
+    if (taskQueue.size() >= maxQueueSize_) {
+      return false;
+    }
+    if (sequentialCallbacks_) {
+      return pendingCallbacks.size() < MAX_CALLBACK_QUEUE_SIZE;
+    }
+    return callbackQueue.size() < MAX_CALLBACK_QUEUE_SIZE;
   }
 
   static bool parse_version_triplet(const char *version_text,
@@ -949,6 +971,7 @@ private:
             nextSequentialTask++;
             callbackCond
                 .notify_all(); // 可能需要唤醒等待特定任务ID的线程（如果以后有这种需求）
+            submitWaitCond_.notify_all();
           }
         }
         if (callbackToExec) {
@@ -977,6 +1000,7 @@ private:
           TracyPlot("Pending Callbacks Size", (int64_t)pendingCallbacks.size());
 #endif
           nextSequentialTask++;
+          submitWaitCond_.notify_all();
         }
         if (remainingCallback) {
 #ifdef TRACY_ENABLE
@@ -1005,6 +1029,7 @@ private:
 #endif
             callbackCond
                 .notify_all(); // 可能需要唤醒等待队列空间的线程（如果以后有这种需求）
+            submitWaitCond_.notify_all();
           } else if (stopFlag) {
             break;
           }
@@ -1029,6 +1054,7 @@ private:
 #ifdef TRACY_ENABLE
           TracyPlot("Callback Queue Size", (int64_t)callbackQueue.size());
 #endif
+          submitWaitCond_.notify_all();
         }
         if (remainingTask) {
 #ifdef TRACY_ENABLE
@@ -1071,6 +1097,7 @@ private:
         task = std::move(taskQueue.front());
         taskQueue.pop();
         queueCond.notify_all(); // 让其他线程重新检查条件
+        submitWaitCond_.notify_all();
 #ifdef TRACY_ENABLE
         // 绘制任务队列大小
         TracyPlot("Task Queue Size", (int64_t)taskQueue.size());

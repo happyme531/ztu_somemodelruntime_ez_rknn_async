@@ -34,6 +34,7 @@ class RknnProviderOptions(TypedDict, total=False):
     layout: LayoutLike
     max_queue_size: int
     threads_per_core: int
+    submit_timeout_ms: int
     sequential_callbacks: bool
     schedule: ScheduleLike
     tp_mode: TpModeLike
@@ -50,6 +51,7 @@ def make_provider_options(
     layout: LayoutLike = "nchw_software",
     max_queue_size: int = 3,
     threads_per_core: int = 1,
+    submit_timeout_ms: int = 10000,
     sequential_callbacks: bool = True,
     schedule: Union[ScheduleLike, None] = None,
     tp_mode: Union[TpModeLike, None] = None,
@@ -66,6 +68,8 @@ def make_provider_options(
         max_queue_size: Max pending task count in async queue, must be ``> 0``.
         threads_per_core: Worker thread count per selected NPU core, must be
             ``> 0``.
+        submit_timeout_ms: Max wait time (milliseconds) when submit is blocked
+            by full task/callback queues.
         sequential_callbacks: If True, async callbacks are emitted in submit
             order.
         schedule: Core schedule (data-parallel mode). Accepts int, string
@@ -94,6 +98,7 @@ def make_provider_options(
         "layout": layout,
         "max_queue_size": max_queue_size,
         "threads_per_core": threads_per_core,
+        "submit_timeout_ms": submit_timeout_ms,
         "sequential_callbacks": sequential_callbacks,
         "enable_pacing": enable_pacing,
         "disable_dup_context": disable_dup_context,
