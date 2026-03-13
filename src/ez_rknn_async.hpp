@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
@@ -127,7 +128,8 @@ public:
         useScheduleMask_(schedule.has_value()),
         tpCoreMask_(tpCoreMask.value_or(RKNN_NPU_CORE_AUTO)),
         disableDupContext_(disableDupContext),
-        enablePacing_(enablePacing) {
+        enablePacing_(enablePacing),
+        printPerf_(read_perf_env_enabled()) {
     // 使用 Tracy 标记构造函数
 #ifdef TRACY_ENABLE
     ZoneScopedN("AsyncEzRknn::Constructor");
@@ -620,8 +622,15 @@ public:
   }
 
 private:
+  struct PerfStats {
+    long long set_input_us = 0;
+    long long infer_us = 0;
+    long long copy_output_us = 0;
+  };
+
   // Pacing / Smoothing members
   bool enablePacing_ = false;
+  bool printPerf_ = false;
   std::atomic<float> avg_proc_time_us_{0.0f};
   std::chrono::high_resolution_clock::time_point last_accepted_time_;
   std::mutex pacer_mutex_;
@@ -685,6 +694,7 @@ private:
   std::optional<std::string> sdk_version_warning_;
   std::mutex taskOutputAttrsMutex_;
   std::map<size_t, std::vector<rknn_tensor_attr>> taskOutputAttrs_;
+  std::mutex perfLogMutex_;
 
   // 修改后的 enqueueCallback 函数，直接添加回调，不阻塞等待
   void enqueueCallback(size_t taskId, std::function<void()> cb) {
@@ -719,6 +729,38 @@ private:
       return pendingCallbacks.size() < MAX_CALLBACK_QUEUE_SIZE;
     }
     return callbackQueue.size() < MAX_CALLBACK_QUEUE_SIZE;
+  }
+
+  static bool parse_env_flag_value(const char *value) {
+    if (value == nullptr) {
+      return false;
+    }
+    std::string text(value);
+    for (char &ch : text) {
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return text == "1" || text == "true" || text == "on" || text == "yes";
+  }
+
+  static bool read_perf_env_enabled() {
+    return parse_env_flag_value(std::getenv("ZTU_EZRKNN_ASYNC_PRINT_PERF"));
+  }
+
+  void log_perf_line(size_t taskId, int threadId, int coreId,
+                     const PerfStats &stats) {
+    if (!printPerf_) {
+      return;
+    }
+    const long long total_us =
+        stats.set_input_us + stats.infer_us + stats.copy_output_us;
+    std::lock_guard<std::mutex> lock(perfLogMutex_);
+    std::cerr << "[ztu_ez_rknn_async_perf]"
+              << " task_id=" << taskId << " thread_id=" << threadId
+              << " core_id=" << coreId
+              << " set_input_us=" << stats.set_input_us
+              << " infer_us=" << stats.infer_us
+              << " copy_output_us=" << stats.copy_output_us
+              << " total_us=" << total_us << std::endl;
   }
 
   static bool parse_version_triplet(const char *version_text,
@@ -1112,6 +1154,7 @@ private:
         ZoneText(taskArgs.c_str(), taskArgs.length());
 #endif
         rknn_context ctx = contexts[threadId];
+        PerfStats perfStats;
 
         // 1. 构造并准备输入数据
         std::vector<rknn_input> rknnInputs;
@@ -1161,8 +1204,14 @@ private:
 #ifdef TRACY_ENABLE
           ZoneScopedN("SetInputs");
 #endif
+          const auto set_input_start = std::chrono::steady_clock::now();
           ret = rknn_inputs_set(ctx, static_cast<uint32_t>(rknnInputs.size()),
                                 rknnInputs.data());
+          const auto set_input_end = std::chrono::steady_clock::now();
+          perfStats.set_input_us =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  set_input_end - set_input_start)
+                  .count();
         }
         if (ret < 0) {
 #ifdef TRACY_ENABLE
@@ -1171,6 +1220,7 @@ private:
               "rknn_inputs_set Error: " + std::to_string(ret);
           TracyMessageLC(errorMsg.c_str(), tracy::Color::Red);
 #endif
+          log_perf_line(task.taskId, threadId, coreId, perfStats);
           enqueueCallback(task.taskId, [cb = task.callback,
                                         id = task.taskId]() { cb(id, {}); });
           continue;
@@ -1190,13 +1240,15 @@ private:
 #ifdef TRACY_ENABLE
           ZoneScopedN("RunInference");
 #endif
-          auto inference_start_time = std::chrono::high_resolution_clock::now();
-            ret_run = rknn_run(ctx, nullptr);
-            auto inference_end_time = std::chrono::high_resolution_clock::now();
-            if (ret_run >= 0 && enablePacing_) {
-            auto proc_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                      inference_end_time - inference_start_time)
-                      .count();
+          const auto inference_start_time = std::chrono::steady_clock::now();
+          ret_run = rknn_run(ctx, nullptr);
+          const auto inference_end_time = std::chrono::steady_clock::now();
+          perfStats.infer_us =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  inference_end_time - inference_start_time)
+                  .count();
+          if (ret_run >= 0 && enablePacing_) {
+            auto proc_time_us = perfStats.infer_us;
               float current_avg = avg_proc_time_us_.load();
               if (current_avg == 0.0f) {
                 avg_proc_time_us_.store(static_cast<float>(proc_time_us));
@@ -1215,6 +1267,7 @@ private:
           std::string errorMsg = "rknn_run Error: " + std::to_string(ret_run);
           TracyMessageLC(errorMsg.c_str(), tracy::Color::Red);
 #endif
+          log_perf_line(task.taskId, threadId, coreId, perfStats);
           enqueueCallback(task.taskId, [cb = task.callback,
                                         id = task.taskId]() { cb(id, {}); });
           continue;
@@ -1245,6 +1298,7 @@ private:
 #ifdef TRACY_ENABLE
           ZoneScopedN("CopyOutputs");
 #endif
+          const auto copy_output_start = std::chrono::steady_clock::now();
           std::vector<rknn_output> outputs(io_num.n_output);
           std::vector<std::shared_ptr<float[]>> outputResults(io_num.n_output);
           for (uint32_t i = 0; i < io_num.n_output; i++) {
@@ -1280,6 +1334,11 @@ private:
 
           // 检查内部分配是否失败
           if (ret < 0) {
+            perfStats.copy_output_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - copy_output_start)
+                    .count();
+            log_perf_line(task.taskId, threadId, coreId, perfStats);
             enqueueCallback(task.taskId, [cb = task.callback,
                                           id = task.taskId]() { cb(id, {}); });
             continue; // 继续下一个任务
@@ -1297,6 +1356,11 @@ private:
             // rknn_outputs_release 在 prealloc
             // 模式下通常不需要，但为了安全可以保留（它应该能处理 prealloc）
             rknn_outputs_release(ctx, io_num.n_output, outputs.data());
+            perfStats.copy_output_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - copy_output_start)
+                    .count();
+            log_perf_line(task.taskId, threadId, coreId, perfStats);
             enqueueCallback(task.taskId, [cb = task.callback,
                                           id = task.taskId]() { cb(id, {}); });
             continue;
@@ -1305,11 +1369,17 @@ private:
           // 但 rknn_outputs_release 仍然需要调用以释放 RKNN
           // 内部的一些资源（如果有的话）
           rknn_outputs_release(ctx, io_num.n_output, outputs.data());
+          perfStats.copy_output_us =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - copy_output_start)
+                  .count();
 
           {
             std::lock_guard<std::mutex> lock(taskOutputAttrsMutex_);
             taskOutputAttrs_[task.taskId] = currentOutputAttrs;
           }
+
+          log_perf_line(task.taskId, threadId, coreId, perfStats);
 
           // 输出数据已经通过 outputResults 的智能指针管理，直接移交即可
           enqueueCallback(task.taskId,

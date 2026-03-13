@@ -1,2 +1,4 @@
 assets/
 dist/
+tmp/
+__pycache__
