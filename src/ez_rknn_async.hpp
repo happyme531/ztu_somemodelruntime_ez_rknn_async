@@ -116,7 +116,7 @@ public:
   //           若未设置，则使用 tpCoreMask 模式（默认 RKNN_NPU_CORE_AUTO）。
   // disableDupContext：为 true 时，不使用 rknn_dup_context，改为多次 rknn_init
   AsyncEzRknn(const std::filesystem::path &model_path,
-              Layout layout = Layout::ORIGINAL, size_t maxQueueSize = 3,
+              Layout layout = Layout::NCHW, size_t maxQueueSize = 3,
               int threadsPerCore = 2, bool sequentialCallbacks = true,
               std::optional<std::vector<uint64_t>> schedule = std::nullopt,
               std::optional<rknn_core_mask> tpCoreMask = RKNN_NPU_CORE_AUTO,
@@ -834,11 +834,11 @@ private:
       return;
     }
 
-    if (is_version_less_than(parsed, 2, 3, 2)) {
+    if (is_version_less_than(parsed, 2, 4, 1)) {
       sdk_version_warning_ = "RKNN API version " +
                              std::string(sdk_version.api_version) +
                              " is likely outdated; behavior may be "
-                             "unstable.";
+                             "unstable. Recommended minimum version is 2.4.1.";
     }
   }
 

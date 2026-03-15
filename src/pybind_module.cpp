@@ -48,7 +48,7 @@ struct NodeArgInfo {
 };
 
 struct SessionConfig {
-  std::string layout = "nchw_software";
+  std::string layout = "nchw";
   size_t max_queue_size = 3;
   int threads_per_core = 1;
   int64_t submit_timeout_ms = kDefaultSubmitTimeoutMs;

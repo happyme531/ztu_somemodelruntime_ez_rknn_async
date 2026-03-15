@@ -48,7 +48,7 @@ class RknnProviderOptions(TypedDict, total=False):
 
 def make_provider_options(
     *,
-    layout: LayoutLike = "nchw_software",
+    layout: LayoutLike = "original",
     max_queue_size: int = 3,
     threads_per_core: int = 1,
     submit_timeout_ms: int = 10000,
@@ -63,8 +63,8 @@ def make_provider_options(
     """Build typed RKNN provider options for ``InferenceSession``.
 
     Args:
-        layout: Input layout policy. Common values are ``"nhwc"`` and
-            ``"nchw_software"``.
+        layout: Input layout policy. Common values are ``"nchw"(aka original)`` and
+            ``"nhwc"``.
         max_queue_size: Max pending task count in async queue, must be ``> 0``.
         threads_per_core: Worker thread count per selected NPU core, must be
             ``> 0``.
