@@ -610,6 +610,7 @@ public:
   const std::optional<std::string> &sdk_version_warning() const {
     return sdk_version_warning_;
   }
+  const std::string &custom_string() const { return custom_string_; }
   std::vector<rknn_tensor_attr> takeTaskOutputAttrs(size_t taskId) {
     std::lock_guard<std::mutex> lock(taskOutputAttrsMutex_);
     auto it = taskOutputAttrs_.find(taskId);
@@ -692,6 +693,7 @@ private:
   std::vector<void *> so_handles_;
 #endif
   std::optional<std::string> sdk_version_warning_;
+  std::string custom_string_;
   std::mutex taskOutputAttrsMutex_;
   std::map<size_t, std::vector<rknn_tensor_attr>> taskOutputAttrs_;
   std::mutex perfLogMutex_;
@@ -842,6 +844,21 @@ private:
     }
   }
 
+  void query_custom_string() {
+    custom_string_.clear();
+    rknn_custom_string custom_string;
+    std::memset(&custom_string, 0, sizeof(custom_string));
+    const int ret =
+        rknn_query(initial_ctx, RKNN_QUERY_CUSTOM_STRING, &custom_string,
+                   sizeof(custom_string));
+    if (ret < 0) {
+      return;
+    }
+    const size_t len =
+        strnlen(custom_string.string, sizeof(custom_string.string));
+    custom_string_.assign(custom_string.string, len);
+  }
+
   // 初始化：加载模型文件、初始化 RKNN 上下文并查询 IO 属性
   void init() {
 #ifdef TRACY_ENABLE
@@ -865,6 +882,7 @@ private:
                                std::to_string(ret));
     }
     warn_if_rknn_sdk_too_old();
+    query_custom_string();
     ret =
         rknn_query(initial_ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
     if (ret < 0) {

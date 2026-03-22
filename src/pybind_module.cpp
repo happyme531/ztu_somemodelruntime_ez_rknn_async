@@ -8,6 +8,7 @@
 #include <cstring>
 #include <array>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -45,6 +46,10 @@ struct NodeArgInfo {
   std::string name;
   std::vector<int64_t> shape;
   std::string type;
+};
+
+struct ModelMetadataInfo {
+  std::map<std::string, std::string> custom_metadata_map;
 };
 
 struct SessionConfig {
@@ -776,6 +781,14 @@ public:
   std::vector<NodeArgInfo> get_outputs() const {
     return build_node_args(output_attrs_, output_names_);
   }
+  ModelMetadataInfo get_modelmeta() const {
+    ModelMetadataInfo info;
+    const std::string &custom_string = rknn_->custom_string();
+    if (!custom_string.empty()) {
+      info.custom_metadata_map.emplace("rknn_custom_string", custom_string);
+    }
+    return info;
+  }
 
 private:
   std::vector<ParsedInput> parse_input_feed(const py::object &input_feed,
@@ -1119,6 +1132,13 @@ PYBIND11_MODULE(_core, m) {
           "type", [](const NodeArgInfo &info) { return info.type; },
           "Type string like 'tensor(float32)'.");
 
+  py::class_<ModelMetadataInfo>(m, "ModelMetadata")
+      .def_property_readonly("custom_metadata_map",
+                             [](const ModelMetadataInfo &info) {
+                               return info.custom_metadata_map;
+                             },
+                             "Additional model metadata from RKNN runtime.");
+
   py::class_<InferenceSession>(m, "InferenceSession")
       .def(py::init([](py::object path_or_bytes, py::object sess_options,
                        py::object providers, py::object provider_options,
@@ -1158,10 +1178,11 @@ PYBIND11_MODULE(_core, m) {
            "the oldest pending result. Use reset=True to clear the pipeline.")
       .def("get_inputs", &InferenceSession::get_inputs,
            "Return input NodeArg list (onnxruntime-style).")
+      .def("get_modelmeta", &InferenceSession::get_modelmeta,
+           "Return model metadata (onnxruntime-style).")
       .def("get_outputs", &InferenceSession::get_outputs,
            "Return output NodeArg list (onnxruntime-style).")
       .def_property_readonly("input_names", &InferenceSession::input_names)
       .def_property_readonly("output_names", &InferenceSession::output_names);
 
-  m.attr("__version__") = "0.5.0";
 }
