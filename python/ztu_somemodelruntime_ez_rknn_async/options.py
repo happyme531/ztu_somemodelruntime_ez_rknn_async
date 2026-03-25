@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from os import PathLike
-from typing import Sequence, TypedDict, Union
+from typing import Sequence, Union
 
 try:
-    from typing import Literal
+    from typing import Literal, TypedDict
 except ImportError:  # pragma: no cover - Python 3.7 fallback
-    from typing_extensions import Literal
+    from typing_extensions import Literal, TypedDict
 
-PathLikeStr = Union[str, PathLike[str]]
+PathLikeStr = Union[str, PathLike]
 ScheduleLike = Union[int, str, Sequence[int]]
 TpModeLike = Literal["auto", "all", "0", "1", "2", "0,1", "0,1,2"]
 LayoutLike = Literal[
