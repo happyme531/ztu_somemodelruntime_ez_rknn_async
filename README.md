@@ -20,3 +20,9 @@ Supported Python versions: 3.7+
 | **Zero Dependencies** | ✅ Yes (NumPy only) | ❌ No |
 | **Break Other Packages** | ✅ No | ⚠️ Yes (https://github.com/airockchip/rknn-toolkit2/issues/414) |
 | **Open Source** | 🔓 Yes (AGPLv3) | 🔒 No |
+
+
+## Documentation 
+
+I don't know if it's a good idea to document this library, but anyway, there's an AI generated one that's generally okay: https://deepwiki.com/happyme531/ztu_somemodelruntime_ez_rknn_async
+
