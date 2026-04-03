@@ -981,10 +981,13 @@ private:
         core_mask = static_cast<rknn_core_mask>(1 << core);
       }
       int ret = rknn_set_core_mask(contexts[i], core_mask);
-      if (ret < 0) {
+      if (ret == RKNN_ERR_TARGET_PLATFORM_UNMATCH && (core_mask == RKNN_NPU_CORE_AUTO || core_mask == RKNN_NPU_CORE_0)){
+        // 单核NPU的平台会返回这个错误，这是正常的
+
+      } else if (ret < 0) {
         throw std::runtime_error("rknn_set_core_mask failed for thread " +
                                  std::to_string(i) +
-                                 " with error code: " + std::to_string(ret));
+                                 " with error code: " + std::to_string(ret) + ". Maybe you specified a configuration that is not supported by the current platform");
       }
       workerThreads.emplace_back(&AsyncEzRknn::workerThreadFunc, this, i, core);
       // 为每个工作线程命名 (使用 pthread_setname_np)
