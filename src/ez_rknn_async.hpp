@@ -190,8 +190,11 @@ public:
     void *plugin_lib = dlopen(so_path.c_str(), RTLD_NOW);
     char *error = dlerror();
     if (error != NULL || plugin_lib == nullptr) {
-      throw std::runtime_error("dlopen " + so_path.string() +
-                               " fail: " + (error ? std::string(error) : ""));
+      const std::string message =
+          "dlopen " + so_path.string() + " fail: " +
+          (error ? std::string(error) : "");
+      std::cerr << "Warning: " << message << "(this could lead to a crash due to internal bugs of rknnrt)" << std::endl;
+      throw std::runtime_error(message);
     }
 
     GetCustomOpFunc custom_op_func =
