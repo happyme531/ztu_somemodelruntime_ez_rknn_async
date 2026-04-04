@@ -627,6 +627,9 @@ public:
     if (config.custom_op_default_path) {
       rknn_->load_custom_ops_from_default_path();
     }
+    if (has_custom_op_request) {
+      rknn_->register_loaded_custom_ops();
+    }
 
     input_attrs_ = rknn_->input_attrs;
     output_attrs_ = rknn_->output_attrs;

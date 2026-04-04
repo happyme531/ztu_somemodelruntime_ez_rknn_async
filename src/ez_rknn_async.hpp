@@ -183,7 +183,7 @@ public:
 
 #if ZTU_EZRKNN_ASYNC_HAS_CUSTOM_OP
   void load_custom_op(GetCustomOpFunc custom_op_func) {
-    register_custom_op_for_all_contexts(custom_op_func);
+    append_custom_op(custom_op_func);
   }
 
   void load_custom_op(const std::filesystem::path &so_path) {
@@ -208,9 +208,9 @@ public:
                                std::string(error));
     }
 
-    register_custom_op_for_all_contexts(custom_op_func);
+    append_custom_op(custom_op_func, so_path);
     so_handles_.push_back(plugin_lib);
-    // std::cout << "Successfully loaded and registered " << so_path.string()
+    // std::cout << "Successfully loaded " << so_path.string()
     //           << std::endl;
   }
 
@@ -252,6 +252,10 @@ public:
       }
     }
   }
+
+  void register_loaded_custom_ops() {
+    register_custom_ops_for_all_contexts();
+  }
 #else
   void load_custom_op(GetCustomOpFunc) {
     throw std::runtime_error(kCustomOpDisabledMsg);
@@ -263,6 +267,10 @@ public:
 
   void load_custom_ops_from_default_path() {
     emit_python_user_warning(kCustomOpDisabledMsg);
+  }
+
+  void register_loaded_custom_ops() {
+    throw std::runtime_error(kCustomOpDisabledMsg);
   }
 #endif
 
@@ -707,6 +715,9 @@ private:
   std::map<size_t, std::function<void()>> pendingCallbacks;
 #if ZTU_EZRKNN_ASYNC_HAS_CUSTOM_OP
   std::vector<void *> so_handles_;
+  std::vector<rknn_custom_op> pending_custom_ops_;
+  std::set<std::string> pending_custom_op_keys_;
+  bool custom_ops_registered_ = false;
 #endif
   std::optional<std::string> sdk_version_warning_;
   std::string custom_string_;
@@ -1438,6 +1449,16 @@ private:
   } // 结束 WorkerThreadFunc Zone
 
 #if ZTU_EZRKNN_ASYNC_HAS_CUSTOM_OP
+  static std::string custom_op_key(const rknn_custom_op &op) {
+    return std::string(op.op_type) + "#" + std::to_string(op.version) + "#" +
+           std::to_string(static_cast<int>(op.target));
+  }
+
+  static std::string describe_custom_op(const rknn_custom_op &op) {
+    return std::string(op.op_type) + " (version=" + std::to_string(op.version) +
+           ", target=" + std::to_string(static_cast<int>(op.target)) + ")";
+  }
+
   bool is_dup_context_enabled() const {
 #if ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT
     return false;
@@ -1446,9 +1467,39 @@ private:
 #endif
   }
 
-  void register_custom_op_for_all_contexts(GetCustomOpFunc custom_op_func) {
+  void append_custom_op(GetCustomOpFunc custom_op_func,
+                        const std::optional<std::filesystem::path> &source_path =
+                            std::nullopt) {
     if (custom_op_func == nullptr) {
       throw std::invalid_argument("custom_op_func is null");
+    }
+    if (custom_ops_registered_) {
+      throw std::runtime_error(
+          "Custom ops have already been registered for this session");
+    }
+
+    rknn_custom_op *user_op = custom_op_func();
+    if (user_op == nullptr) {
+      throw std::runtime_error("get_rknn_custom_op returned null");
+    }
+
+    rknn_custom_op op = *user_op;
+    const std::string key = custom_op_key(op);
+    const auto [_, inserted] = pending_custom_op_keys_.insert(key);
+    if (!inserted) {
+      std::string message =
+          "Duplicate custom op definition detected: " + describe_custom_op(op);
+      if (source_path.has_value()) {
+        message += " from " + source_path->string();
+      }
+      throw std::runtime_error(message);
+    }
+    pending_custom_ops_.push_back(op);
+  }
+
+  void register_custom_ops_for_all_contexts() {
+    if (custom_ops_registered_ || pending_custom_ops_.empty()) {
+      return;
     }
 
     // 检查是否需要警告：使用 dup_context 且总线程数大于 1
@@ -1462,29 +1513,30 @@ private:
 
     bool registered = false;
     for (auto ctx : contexts) {
-      register_custom_op_for_context(ctx, custom_op_func);
+      register_custom_ops_for_context(
+          ctx, pending_custom_ops_.data(),
+          static_cast<uint32_t>(pending_custom_ops_.size()));
       registered = true;
     }
     if (!registered && initial_ctx != 0) {
-      register_custom_op_for_context(initial_ctx, custom_op_func);
+      register_custom_ops_for_context(
+          initial_ctx, pending_custom_ops_.data(),
+          static_cast<uint32_t>(pending_custom_ops_.size()));
       registered = true;
     }
     if (!registered) {
       throw std::runtime_error(
           "No RKNN context available for custom op registration");
     }
+    custom_ops_registered_ = true;
   }
 
-  void register_custom_op_for_context(rknn_context ctx,
-                                      GetCustomOpFunc custom_op_func) {
+  void register_custom_ops_for_context(rknn_context ctx, rknn_custom_op *ops,
+                                       uint32_t custom_op_num) {
     if (ctx == 0) {
       throw std::runtime_error("RKNN context is null");
     }
-    rknn_custom_op *user_op = custom_op_func();
-    if (user_op == nullptr) {
-      throw std::runtime_error("get_rknn_custom_op returned null");
-    }
-    int ret = rknn_register_custom_ops(ctx, user_op, 1);
+    int ret = rknn_register_custom_ops(ctx, ops, custom_op_num);
     if (ret < 0) {
       throw std::runtime_error("rknn_register_custom_ops fail! ret = " +
                                std::to_string(ret));
