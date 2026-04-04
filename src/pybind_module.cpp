@@ -23,6 +23,12 @@
 
 namespace py = pybind11;
 
+void emit_python_user_warning(const std::string &message) {
+  py::module_ warnings = py::module_::import("warnings");
+  py::object user_warning = py::module_::import("builtins").attr("UserWarning");
+  warnings.attr("warn")(py::str(message), user_warning, 2);
+}
+
 namespace {
 
 constexpr int64_t kDefaultSubmitTimeoutMs = 10000;
@@ -563,12 +569,6 @@ bool parse_dispatch_batch_flag(const py::object &run_options_obj) {
     }
   }
   return false;
-}
-
-void emit_python_user_warning(const std::string &message) {
-  py::module_ warnings = py::module_::import("warnings");
-  py::object user_warning = py::module_::import("builtins").attr("UserWarning");
-  warnings.attr("warn")(py::str(message), user_warning, 2);
 }
 
 class InferenceSession {

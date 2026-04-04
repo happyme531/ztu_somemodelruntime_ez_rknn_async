@@ -69,6 +69,8 @@
 #define ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT 0
 #endif
 
+extern void emit_python_user_warning(const std::string &message);
+
 namespace ztu {
 namespace rk {
 // 异步推理类，基于回调函数返回推理结果
@@ -127,8 +129,7 @@ public:
         schedule_(schedule.value_or(std::vector<uint64_t>{0})),
         useScheduleMask_(schedule.has_value()),
         tpCoreMask_(tpCoreMask.value_or(RKNN_NPU_CORE_AUTO)),
-        disableDupContext_(disableDupContext),
-        enablePacing_(enablePacing),
+        disableDupContext_(disableDupContext), enablePacing_(enablePacing),
         printPerf_(read_perf_env_enabled()) {
     // 使用 Tracy 标记构造函数
 #ifdef TRACY_ENABLE
@@ -186,14 +187,15 @@ public:
   }
 
   void load_custom_op(const std::filesystem::path &so_path) {
-    std::cout << "Loading custom op plugin: " << so_path.string() << std::endl;
+    // std::cout << "Loading custom op plugin: " << so_path.string() << std::endl;
     void *plugin_lib = dlopen(so_path.c_str(), RTLD_NOW);
     char *error = dlerror();
     if (error != NULL || plugin_lib == nullptr) {
-      const std::string message =
-          "dlopen " + so_path.string() + " fail: " +
-          (error ? std::string(error) : "");
-      std::cerr << "Warning: " << message << "(this could lead to a crash due to internal bugs of rknnrt)" << std::endl;
+      const std::string message = "dlopen " + so_path.string() +
+                                  " fail: " + (error ? std::string(error) : "");
+      emit_python_user_warning(
+          message +
+          " (this could lead to a crash due to internal bugs of rknnrt)");
       throw std::runtime_error(message);
     }
 
@@ -208,8 +210,8 @@ public:
 
     register_custom_op_for_all_contexts(custom_op_func);
     so_handles_.push_back(plugin_lib);
-    std::cout << "Successfully loaded and registered " << so_path.string()
-              << std::endl;
+    // std::cout << "Successfully loaded and registered " << so_path.string()
+    //           << std::endl;
   }
 
   void load_custom_ops_from_default_path() {
@@ -223,14 +225,14 @@ public:
 #elif defined(__linux__)
     plugin_dir = "/usr/lib/rknpu/op_plugins/";
 #else
-    std::cerr << "Warning: Default custom op path is not defined for this OS."
-              << std::endl;
+    emit_python_user_warning(
+        "Default custom op path is not defined for this OS.");
     return;
 #endif
 
     if (!std::filesystem::exists(plugin_dir)) {
-      std::cerr << "Warning: Default plugin directory does not exist: "
-                << plugin_dir << std::endl;
+      emit_python_user_warning("Default plugin directory does not exist: " +
+                               plugin_dir);
       return;
     }
 
@@ -243,8 +245,8 @@ public:
           try {
             load_custom_op(entry.path());
           } catch (const std::runtime_error &e) {
-            std::cerr << "Failed to load plugin " << filename << ": "
-                      << e.what() << std::endl;
+            emit_python_user_warning("Failed to load plugin " + filename +
+                                     ": " + e.what());
           }
         }
       }
@@ -260,7 +262,7 @@ public:
   }
 
   void load_custom_ops_from_default_path() {
-    std::cerr << "Warning: " << kCustomOpDisabledMsg << std::endl;
+    emit_python_user_warning(kCustomOpDisabledMsg);
   }
 #endif
 
@@ -334,14 +336,19 @@ public:
     for (size_t i = 0; i < input_attrs.size(); ++i) {
       Task::Shape shape;
       shape.n_dims = input_attrs[i].n_dims;
-      std::copy_n(input_attrs[i].dims, input_attrs[i].n_dims, shape.dims.begin());
+      std::copy_n(input_attrs[i].dims, input_attrs[i].n_dims,
+                  shape.dims.begin());
       inputShapes.push_back(shape);
     }
 
     size_t taskId = taskCounter++;
     size_t coreId = schedule_[taskId % schedule_.size()];
-    Task task{taskId, std::move(inputCopies), std::move(inputTypes),
-              std::move(inputShapes), std::move(callback), coreId};
+    Task task{taskId,
+              std::move(inputCopies),
+              std::move(inputTypes),
+              std::move(inputShapes),
+              std::move(callback),
+              coreId};
 
     {
       std::lock_guard<std::mutex> lock(queueMutex);
@@ -428,7 +435,8 @@ public:
       }
       const size_t expected_elems =
           calcNumElements(inputs[i].dims.data(), inputs[i].n_dims);
-      const size_t expected_bytes = expected_elems * rknnTypeSize(inputs[i].type);
+      const size_t expected_bytes =
+          expected_elems * rknnTypeSize(inputs[i].type);
       if (inputs[i].bytes != expected_bytes) {
         throw std::runtime_error(
             "Input size mismatch at index " + std::to_string(i) +
@@ -447,8 +455,12 @@ public:
 
     size_t taskId = taskCounter++;
     size_t coreId = schedule_[taskId % schedule_.size()];
-    Task task{taskId, std::move(inputCopies), std::move(inputTypes),
-              std::move(inputShapes), std::move(callback), coreId};
+    Task task{taskId,
+              std::move(inputCopies),
+              std::move(inputTypes),
+              std::move(inputShapes),
+              std::move(callback),
+              coreId};
 
     {
       std::lock_guard<std::mutex> lock(queueMutex);
@@ -669,7 +681,8 @@ private:
   // RKNN 相关变量
   rknn_context initial_ctx = 0;
 #if EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK
-  std::map<int, std::mutex> coreMutexes_; // 每个核心一个互斥锁，串行同核 rknn_run
+  std::map<int, std::mutex>
+      coreMutexes_; // 每个核心一个互斥锁，串行同核 rknn_run
 #endif
 
   // 线程池及任务队列
@@ -761,8 +774,7 @@ private:
     std::lock_guard<std::mutex> lock(perfLogMutex_);
     std::cerr << "[ztu_ez_rknn_async_perf]"
               << " task_id=" << taskId << " thread_id=" << threadId
-              << " core_id=" << coreId
-              << " set_input_us=" << stats.set_input_us
+              << " core_id=" << coreId << " set_input_us=" << stats.set_input_us
               << " infer_us=" << stats.infer_us
               << " copy_output_us=" << stats.copy_output_us
               << " total_us=" << total_us << std::endl;
@@ -851,9 +863,8 @@ private:
     custom_string_.clear();
     rknn_custom_string custom_string;
     std::memset(&custom_string, 0, sizeof(custom_string));
-    const int ret =
-        rknn_query(initial_ctx, RKNN_QUERY_CUSTOM_STRING, &custom_string,
-                   sizeof(custom_string));
+    const int ret = rknn_query(initial_ctx, RKNN_QUERY_CUSTOM_STRING,
+                               &custom_string, sizeof(custom_string));
     if (ret < 0) {
       return;
     }
@@ -867,17 +878,17 @@ private:
 #ifdef TRACY_ENABLE
     ZoneScopedN("AsyncEzRknn::init");
 #endif
-      std::ifstream file(model_path_, std::ios::binary | std::ios::ate);
-      if (!file.is_open()) {
-        throw std::runtime_error("Failed to open model file: " +
-                                 model_path_.string());
-      }
+    std::ifstream file(model_path_, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+      throw std::runtime_error("Failed to open model file: " +
+                               model_path_.string());
+    }
     size_t model_size = file.tellg();
-      file.seekg(0, std::ios::beg);
+    file.seekg(0, std::ios::beg);
     std::vector<uint8_t> model_data(model_size);
     if (!file.read(reinterpret_cast<char *>(model_data.data()), model_size)) {
-        throw std::runtime_error("Failed to read model file");
-      }
+      throw std::runtime_error("Failed to read model file");
+    }
     int ret =
         rknn_init(&initial_ctx, model_data.data(), model_size, 0, nullptr);
     if (ret < 0) {
@@ -981,13 +992,16 @@ private:
         core_mask = static_cast<rknn_core_mask>(1 << core);
       }
       int ret = rknn_set_core_mask(contexts[i], core_mask);
-      if (ret == RKNN_ERR_TARGET_PLATFORM_UNMATCH && (core_mask == RKNN_NPU_CORE_AUTO || core_mask == RKNN_NPU_CORE_0)){
+      if (ret == RKNN_ERR_TARGET_PLATFORM_UNMATCH &&
+          (core_mask == RKNN_NPU_CORE_AUTO || core_mask == RKNN_NPU_CORE_0)) {
         // 单核NPU的平台会返回这个错误，这是正常的
 
       } else if (ret < 0) {
         throw std::runtime_error("rknn_set_core_mask failed for thread " +
                                  std::to_string(i) +
-                                 " with error code: " + std::to_string(ret) + ". Maybe you specified a configuration that is not supported by the current platform");
+                                 " with error code: " + std::to_string(ret) +
+                                 ". Maybe you specified a configuration that "
+                                 "is not supported by the current platform");
       }
       workerThreads.emplace_back(&AsyncEzRknn::workerThreadFunc, this, i, core);
       // 为每个工作线程命名 (使用 pthread_setname_np)
@@ -1211,8 +1225,8 @@ private:
           currentInputAttrs[i].n_dims = task.inputShapes[i].n_dims;
           std::fill(currentInputAttrs[i].dims,
                     currentInputAttrs[i].dims + RKNN_MAX_DIMS, 0);
-          std::copy_n(task.inputShapes[i].dims.begin(), task.inputShapes[i].n_dims,
-                      currentInputAttrs[i].dims);
+          std::copy_n(task.inputShapes[i].dims.begin(),
+                      task.inputShapes[i].n_dims, currentInputAttrs[i].dims);
         }
         if (isDynamicShapeModel_) {
           ret = rknn_set_input_shapes(ctx, io_num.n_input,
@@ -1254,7 +1268,8 @@ private:
         int ret_run;
         {
 #if EZRKNN_ASYNC_ENABLE_CORE_RUN_LOCK
-          // schedule 模式下同 core 串行化；tpCoreMask 模式允许多 context 并发运行
+          // schedule 模式下同 core 串行化；tpCoreMask 模式允许多 context
+          // 并发运行
           std::optional<std::lock_guard<std::mutex>> coreLock;
           if (useScheduleMask_) {
             std::mutex &currentCoreMutex = coreMutexes_.at(task.coreId);
@@ -1273,17 +1288,17 @@ private:
                   .count();
           if (ret_run >= 0 && enablePacing_) {
             auto proc_time_us = perfStats.infer_us;
-              float current_avg = avg_proc_time_us_.load();
-              if (current_avg == 0.0f) {
-                avg_proc_time_us_.store(static_cast<float>(proc_time_us));
-              } else {
-                avg_proc_time_us_.store(0.95f * current_avg +
+            float current_avg = avg_proc_time_us_.load();
+            if (current_avg == 0.0f) {
+              avg_proc_time_us_.store(static_cast<float>(proc_time_us));
+            } else {
+              avg_proc_time_us_.store(0.95f * current_avg +
                                       0.05f * static_cast<float>(proc_time_us));
-              }
-#ifdef TRACY_ENABLE
-              TracyPlot("Current Proc Time (us)", proc_time_us);
-#endif
             }
+#ifdef TRACY_ENABLE
+            TracyPlot("Current Proc Time (us)", proc_time_us);
+#endif
+          }
         } // 结束推理作用域
 
         if (ret_run < 0) {
@@ -1304,11 +1319,13 @@ private:
             ret = rknn_query(ctx, RKNN_QUERY_CURRENT_OUTPUT_ATTR,
                              &currentOutputAttrs[i], sizeof(rknn_tensor_attr));
             if (ret < 0) {
-              ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &currentOutputAttrs[i],
-                               sizeof(rknn_tensor_attr));
+              ret =
+                  rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR,
+                             &currentOutputAttrs[i], sizeof(rknn_tensor_attr));
               if (ret < 0) {
                 throw std::runtime_error(
-                    "Failed to query output attr for index " + std::to_string(i) +
+                    "Failed to query output attr for index " +
+                    std::to_string(i) +
                     " with error code: " + std::to_string(ret));
               }
             }
@@ -1436,12 +1453,11 @@ private:
 
     // 检查是否需要警告：使用 dup_context 且总线程数大于 1
     if (is_dup_context_enabled() && contexts.size() > 1) {
-      std::cerr
-          << "WARNING: Registering custom ops with dup_context and "
-             "multiple threads (>1) may cause issues due to RKNN internal "
-             "bugs. Consider defining ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT "
-             "to use rknn_init instead."
-          << std::endl;
+      emit_python_user_warning(
+          "Registering custom ops with dup_context and "
+          "multiple threads (>1) may cause issues due to RKNN internal "
+          "bugs. Consider defining ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT "
+          "to use rknn_init instead.");
     }
 
     bool registered = false;
