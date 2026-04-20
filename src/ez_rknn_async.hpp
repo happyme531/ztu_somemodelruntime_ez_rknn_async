@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rknn_api.h"
+#include "rknn_error_utils.hpp"
 #include <algorithm>
 #include <any>
 #include <array>
@@ -93,11 +94,14 @@ public:
     ANY,
   };
 
-  // 回调函数类型：参数为任务 id 和输出结果（每个输出为智能指针，指向拷贝后的
-  // float 数组）
+  // 回调函数类型：参数为任务 id 和异步结果。
   using InferenceResult = std::vector<std::shared_ptr<float[]>>;
+  struct InferenceResponse {
+    InferenceResult outputs;
+    std::string error_message;
+  };
   using InferenceCallback =
-      std::function<void(size_t taskId, InferenceResult outputs)>;
+      std::function<void(size_t taskId, InferenceResponse response)>;
 
   // 动态输入视图（用于非模板接口，例如 Python 绑定）
   struct InputView {
@@ -492,7 +496,7 @@ public:
   // 伪同步流水线推理器：单线程使用，每次调用提交一个新任务并在填满延迟后返回旧结果
   class PipelineRunner {
   public:
-    using Result = InferenceResult;
+    using Result = InferenceResponse;
 
     PipelineRunner(AsyncEzRknn &parent, size_t pipelineDepth)
         : parent_(parent), depth_(pipelineDepth) {
@@ -564,9 +568,9 @@ public:
       std::future<Result> fut = promisePtr->get_future();
       while (true) {
         auto submitted = parent_.asyncInference(
-            [promisePtr](size_t, Result outputs) mutable {
+            [promisePtr](size_t, Result response) mutable {
               try {
-                promisePtr->set_value(std::move(outputs));
+                promisePtr->set_value(std::move(response));
               } catch (...) {
                 try {
                   promisePtr->set_exception(std::current_exception());
@@ -617,8 +621,8 @@ public:
         }
       };
       UserData data = extractData();
-      Result outputs = item.future.get();
-      return {std::move(data), std::move(outputs)};
+      Result response = item.future.get();
+      return {std::move(data), std::move(response)};
     }
 
     AsyncEzRknn &parent_;
@@ -903,8 +907,7 @@ private:
     int ret =
         rknn_init(&initial_ctx, model_data.data(), model_size, 0, nullptr);
     if (ret < 0) {
-      throw std::runtime_error("rknn_init failed with error code: " +
-                               std::to_string(ret));
+      throw std::runtime_error(format_rknn_error("rknn_init", ret));
     }
     warn_if_rknn_sdk_too_old();
     query_custom_string();
@@ -912,8 +915,7 @@ private:
         rknn_query(initial_ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
     if (ret < 0) {
       throw std::runtime_error(
-          "rknn_query for IO num failed with error code: " +
-          std::to_string(ret));
+          format_rknn_error("rknn_query(RKNN_QUERY_IN_OUT_NUM)", ret));
     }
     input_attrs.resize(io_num.n_input);
     for (uint32_t i = 0; i < io_num.n_input; i++) {
@@ -921,8 +923,8 @@ private:
       ret = rknn_query(initial_ctx, RKNN_QUERY_INPUT_ATTR, &input_attrs[i],
                        sizeof(rknn_tensor_attr));
       if (ret < 0) {
-        throw std::runtime_error("Failed to query input attr for index " +
-                                 std::to_string(i));
+        throw std::runtime_error(format_rknn_error_for_index(
+            "rknn_query(RKNN_QUERY_INPUT_ATTR)", "input attr", i, ret));
       }
       if (input_attrs[i].n_dims == 4 && layout_ == Layout::ORIGINAL) {
         auto n = input_attrs[i].dims[0];
@@ -941,8 +943,8 @@ private:
       ret = rknn_query(initial_ctx, RKNN_QUERY_OUTPUT_ATTR, &output_attrs[i],
                        sizeof(rknn_tensor_attr));
       if (ret < 0) {
-        throw std::runtime_error("Failed to query output attr for index " +
-                                 std::to_string(i));
+        throw std::runtime_error(format_rknn_error_for_index(
+            "rknn_query(RKNN_QUERY_OUTPUT_ATTR)", "output attr", i, ret));
       }
     }
     isDynamicShapeModel_ = detect_dynamic_shape_model(initial_ctx);
@@ -984,15 +986,14 @@ private:
         int ret =
             rknn_init(&contexts[i], model_data.data(), model_size, 0, nullptr);
         if (ret < 0) {
-          throw std::runtime_error("rknn_init failed with error code: " +
-                                   std::to_string(ret));
+          throw std::runtime_error(format_rknn_error("rknn_init", ret));
         }
       } else {
         // 使用 dup_context 复制初始 context
         int ret = rknn_dup_context(&initial_ctx, &contexts[i]);
         if (ret < 0) {
-          throw std::runtime_error("rknn_dup_context failed with error code: " +
-                                   std::to_string(ret));
+          throw std::runtime_error(
+              format_rknn_error("rknn_dup_context", ret));
         }
       }
     }
@@ -1009,8 +1010,8 @@ private:
 
       } else if (ret < 0) {
         throw std::runtime_error("rknn_set_core_mask failed for thread " +
-                                 std::to_string(i) +
-                                 " with error code: " + std::to_string(ret) +
+                                 std::to_string(i) + ": " +
+                                 format_rknn_status(ret) +
                                  ". Maybe you specified a configuration that "
                                  "is not supported by the current platform");
       }
@@ -1243,8 +1244,15 @@ private:
           ret = rknn_set_input_shapes(ctx, io_num.n_input,
                                       currentInputAttrs.data());
           if (ret < 0) {
-            throw std::runtime_error("rknn_set_input_shapes Error: " +
-                                     std::to_string(ret));
+            const std::string error_message =
+                format_rknn_error("rknn_set_input_shapes", ret);
+            log_perf_line(task.taskId, threadId, coreId, perfStats);
+            enqueueCallback(task.taskId,
+                            [cb = task.callback, id = task.taskId,
+                             error_message]() mutable {
+                              cb(id, InferenceResponse{{}, error_message});
+                            });
+            continue;
           }
         }
 
@@ -1265,13 +1273,17 @@ private:
         if (ret < 0) {
 #ifdef TRACY_ENABLE
           // 记录错误信息
-          std::string errorMsg =
-              "rknn_inputs_set Error: " + std::to_string(ret);
+          std::string errorMsg = format_rknn_error("rknn_inputs_set", ret);
           TracyMessageLC(errorMsg.c_str(), tracy::Color::Red);
 #endif
           log_perf_line(task.taskId, threadId, coreId, perfStats);
-          enqueueCallback(task.taskId, [cb = task.callback,
-                                        id = task.taskId]() { cb(id, {}); });
+          const std::string error_message =
+              format_rknn_error("rknn_inputs_set", ret);
+          enqueueCallback(task.taskId,
+                          [cb = task.callback, id = task.taskId,
+                           error_message]() mutable {
+                            cb(id, InferenceResponse{{}, error_message});
+                          });
           continue;
         }
 
@@ -1314,12 +1326,17 @@ private:
 
         if (ret_run < 0) {
 #ifdef TRACY_ENABLE
-          std::string errorMsg = "rknn_run Error: " + std::to_string(ret_run);
+          std::string errorMsg = format_rknn_error("rknn_run", ret_run);
           TracyMessageLC(errorMsg.c_str(), tracy::Color::Red);
 #endif
           log_perf_line(task.taskId, threadId, coreId, perfStats);
-          enqueueCallback(task.taskId, [cb = task.callback,
-                                        id = task.taskId]() { cb(id, {}); });
+          const std::string error_message =
+              format_rknn_error("rknn_run", ret_run);
+          enqueueCallback(task.taskId,
+                          [cb = task.callback, id = task.taskId,
+                           error_message]() mutable {
+                            cb(id, InferenceResponse{{}, error_message});
+                          });
           continue;
         }
 
@@ -1334,12 +1351,22 @@ private:
                   rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR,
                              &currentOutputAttrs[i], sizeof(rknn_tensor_attr));
               if (ret < 0) {
-                throw std::runtime_error(
-                    "Failed to query output attr for index " +
-                    std::to_string(i) +
-                    " with error code: " + std::to_string(ret));
+                const std::string error_message = format_rknn_error_for_index(
+                    "rknn_query(RKNN_QUERY_OUTPUT_ATTR)",
+                    "output attr", i, ret);
+                log_perf_line(task.taskId, threadId, coreId, perfStats);
+                enqueueCallback(task.taskId,
+                                [cb = task.callback, id = task.taskId,
+                                 error_message]() mutable {
+                                  cb(id, InferenceResponse{{}, error_message});
+                                });
+                currentOutputAttrs.clear();
+                break;
               }
             }
+          }
+          if (currentOutputAttrs.empty()) {
+            continue;
           }
         } else {
           currentOutputAttrs = output_attrs;
@@ -1375,6 +1402,15 @@ private:
                 delete[] reinterpret_cast<float *>(outputs[j].buf);
               }
               ret = -1; // 标记错误
+              const std::string error_message =
+                  "Failed to allocate output buffer for output " +
+                  std::to_string(i);
+              log_perf_line(task.taskId, threadId, coreId, perfStats);
+              enqueueCallback(task.taskId,
+                              [cb = task.callback, id = task.taskId,
+                               error_message]() mutable {
+                                cb(id, InferenceResponse{{}, error_message});
+                              });
               break;    // 跳出循环
             }
             outputs[i].buf = reinterpret_cast<void *>(buf);
@@ -1391,8 +1427,6 @@ private:
                     std::chrono::steady_clock::now() - copy_output_start)
                     .count();
             log_perf_line(task.taskId, threadId, coreId, perfStats);
-            enqueueCallback(task.taskId, [cb = task.callback,
-                                          id = task.taskId]() { cb(id, {}); });
             continue; // 继续下一个任务
           }
 
@@ -1401,7 +1435,7 @@ private:
           if (ret < 0) {
 #ifdef TRACY_ENABLE
             std::string errorMsg =
-                "rknn_outputs_get Error: " + std::to_string(ret);
+                format_rknn_error("rknn_outputs_get", ret);
             TracyMessageLC(errorMsg.c_str(), tracy::Color::Red);
 #endif
             // 即使 get 失败，之前分配的内存也需要通过智能指针自动释放
@@ -1412,9 +1446,14 @@ private:
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - copy_output_start)
                     .count();
+            const std::string error_message =
+                format_rknn_error("rknn_outputs_get", ret);
             log_perf_line(task.taskId, threadId, coreId, perfStats);
-            enqueueCallback(task.taskId, [cb = task.callback,
-                                          id = task.taskId]() { cb(id, {}); });
+            enqueueCallback(task.taskId,
+                            [cb = task.callback, id = task.taskId,
+                             error_message]() mutable {
+                              cb(id, InferenceResponse{{}, error_message});
+                            });
             continue;
           }
           // 在 prealloc 模式下，RKNN 不会接管内存，需要我们自己管理
@@ -1441,7 +1480,7 @@ private:
                             // 标记回调入队后的 lambda 执行
                             ZoneScopedN("CallbackLambdaExecution");
 #endif
-                            cb(id, std::move(outs));
+                            cb(id, InferenceResponse{std::move(outs), ""});
                           });
         }
       } // 结束 TaskProcessing Zone
@@ -1538,8 +1577,8 @@ private:
     }
     int ret = rknn_register_custom_ops(ctx, ops, custom_op_num);
     if (ret < 0) {
-      throw std::runtime_error("rknn_register_custom_ops fail! ret = " +
-                               std::to_string(ret));
+      throw std::runtime_error(
+          format_rknn_error("rknn_register_custom_ops", ret));
     }
   }
 #endif

@@ -44,7 +44,8 @@ struct ParsedInput {
 };
 
 struct PendingResult {
-  std::future<std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>>
+  std::future<std::pair<AsyncEzRknn::InferenceResponse,
+                        std::vector<rknn_tensor_attr>>>
       future;
 };
 
@@ -679,7 +680,7 @@ public:
       return run_batch(std::move(inputs), output_indices);
     }
     auto result = run_sync(std::move(inputs));
-    return build_outputs(result.first, result.second, output_indices);
+    return build_outputs(result.first.outputs, result.second, output_indices);
   }
 
   py::none run_async(py::object output_names_obj, py::object input_feed,
@@ -706,21 +707,21 @@ public:
       py::gil_scoped_release release;
       submit_task_async_blocking(
           views,
-          [this, cb_shared, user_data_shared,
-           indices_shared](size_t task_id, AsyncEzRknn::InferenceResult outputs) {
+          [this, cb_shared, user_data_shared, indices_shared](
+              size_t task_id, AsyncEzRknn::InferenceResponse response) {
             py::gil_scoped_acquire gil;
             try {
-              if (outputs.empty()) {
+              if (!response.error_message.empty()) {
                 (*cb_shared)(py::none(), *user_data_shared,
-                             py::str("Inference failed"));
+                             py::str(response.error_message));
                 return;
               }
               auto attrs = rknn_->takeTaskOutputAttrs(task_id);
               if (attrs.empty()) {
                 attrs = output_attrs_;
               }
-              py::list result =
-                  build_outputs_by_indices(outputs, attrs, *indices_shared);
+              py::list result = build_outputs_by_indices(
+                  response.outputs, attrs, *indices_shared);
               (*cb_shared)(result, *user_data_shared, py::str(""));
             } catch (const py::error_already_set &e) {
               PyErr_WriteUnraisable(e.value().ptr());
@@ -764,16 +765,16 @@ public:
     pipeline_queue_.pop();
     lock.unlock();
 
-    std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>
+    std::pair<AsyncEzRknn::InferenceResponse, std::vector<rknn_tensor_attr>>
         result_pack;
     {
       py::gil_scoped_release release;
       result_pack = ready.future.get();
     }
-    if (result_pack.first.empty()) {
-      throw std::runtime_error("Inference failed");
+    if (!result_pack.first.error_message.empty()) {
+      throw std::runtime_error(result_pack.first.error_message);
     }
-    return outputs_to_python(result_pack.first, result_pack.second);
+    return outputs_to_python(result_pack.first.outputs, result_pack.second);
   }
 
   std::vector<std::string> input_names() const { return input_names_; }
@@ -899,23 +900,26 @@ private:
     }
   }
 
-  std::future<std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>>
+  std::future<std::pair<AsyncEzRknn::InferenceResponse,
+                        std::vector<rknn_tensor_attr>>>
   submit_task_blocking(const std::vector<AsyncEzRknn::InputView> &views) {
     using ResultPack =
-        std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>;
+        std::pair<AsyncEzRknn::InferenceResponse, std::vector<rknn_tensor_attr>>;
     auto promise = std::make_shared<std::promise<ResultPack>>();
     auto future = promise->get_future();
     const auto deadline = std::chrono::steady_clock::now() + submit_timeout_;
     while (true) {
       auto submitted = rknn_->asyncInferenceDyn(
-          [this, promise](size_t task_id, AsyncEzRknn::InferenceResult outputs) {
+          [this, promise](size_t task_id, AsyncEzRknn::InferenceResponse response) {
             try {
-              auto attrs = rknn_->takeTaskOutputAttrs(task_id);
-              if (attrs.empty()) {
-                attrs = output_attrs_;
+              std::vector<rknn_tensor_attr> attrs;
+              if (response.error_message.empty()) {
+                attrs = rknn_->takeTaskOutputAttrs(task_id);
+                if (attrs.empty()) {
+                  attrs = output_attrs_;
+                }
               }
-              promise->set_value(
-                  ResultPack{std::move(outputs), std::move(attrs)});
+              promise->set_value(ResultPack{std::move(response), std::move(attrs)});
             } catch (...) {
               try {
                 promise->set_exception(std::current_exception());
@@ -936,14 +940,14 @@ private:
     return future;
   }
 
-  std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>
+  std::pair<AsyncEzRknn::InferenceResponse, std::vector<rknn_tensor_attr>>
   run_sync(std::vector<ParsedInput> inputs) {
     auto views = to_input_views(inputs);
     auto future = submit_task_blocking(views);
     py::gil_scoped_release release;
     auto result = future.get();
-    if (result.first.empty()) {
-      throw std::runtime_error("Inference failed");
+    if (!result.first.error_message.empty()) {
+      throw std::runtime_error(result.first.error_message);
     }
     if (result.second.size() != output_attrs_.size()) {
       throw std::runtime_error("Output attr count mismatch");
@@ -1000,7 +1004,8 @@ private:
     }
 
     std::vector<
-        std::future<std::pair<AsyncEzRknn::InferenceResult, std::vector<rknn_tensor_attr>>>>
+        std::future<std::pair<AsyncEzRknn::InferenceResponse,
+                              std::vector<rknn_tensor_attr>>>>
         futures;
     futures.reserve(batch);
 
@@ -1034,7 +1039,10 @@ private:
       py::gil_scoped_release release;
       for (size_t b = 0; b < batch; ++b) {
         auto one = futures[b].get();
-        batch_outputs[b] = std::move(one.first);
+        if (!one.first.error_message.empty()) {
+          throw std::runtime_error(one.first.error_message);
+        }
+        batch_outputs[b] = std::move(one.first.outputs);
         batch_attrs[b] = std::move(one.second);
         if (batch_outputs[b].empty()) {
           throw std::runtime_error("Inference failed in batch mode");
