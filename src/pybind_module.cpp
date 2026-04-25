@@ -39,6 +39,9 @@ using ztu::rk::RknnContextHolder;
 using ztu::rk::RknnOrtValue;
 using ztu::rk::ZeroCopyEzRknn;
 using ztu::rk::ZeroCopyInputLayout;
+using ztu::rk::attr_shape_i64;
+using ztu::rk::require_shape_matches;
+using ztu::rk::shape_to_string;
 using ztu::rk::rknn_tensor_type_to_numpy_dtype;
 
 struct ParsedInput {
@@ -500,8 +503,17 @@ std::string resolve_model_path(const py::object &path_or_bytes) {
   return py::cast<std::string>(os_path);
 }
 
-ParsedInput parse_array(py::array array, uint32_t expected_dims,
-                        bool allow_batch) {
+std::vector<int64_t> array_shape_i64(const py::array &array) {
+  std::vector<int64_t> shape;
+  shape.reserve(array.ndim());
+  for (ssize_t i = 0; i < array.ndim(); ++i) {
+    shape.push_back(static_cast<int64_t>(array.shape(i)));
+  }
+  return shape;
+}
+
+ParsedInput parse_array(py::array array, const rknn_tensor_attr &expected_attr,
+                        bool allow_batch, const std::string &input_name) {
   if (!array) {
     throw std::runtime_error("Input must be a numpy array");
   }
@@ -510,6 +522,7 @@ ParsedInput parse_array(py::array array, uint32_t expected_dims,
   if (array.ndim() > RKNN_MAX_DIMS) {
     throw std::runtime_error("Input rank is too large");
   }
+  const uint32_t expected_dims = expected_attr.n_dims;
   if (expected_dims > 0 && static_cast<uint32_t>(array.ndim()) != expected_dims) {
     throw std::runtime_error("Input rank mismatch: expected " +
                              std::to_string(expected_dims) + ", got " +
@@ -517,6 +530,23 @@ ParsedInput parse_array(py::array array, uint32_t expected_dims,
   }
   if (allow_batch && array.ndim() < 1) {
     throw std::runtime_error("Batch input must have ndim >= 1");
+  }
+  const std::vector<int64_t> actual_shape = array_shape_i64(array);
+  const std::vector<int64_t> expected_shape = attr_shape_i64(expected_attr);
+  if (allow_batch) {
+    for (size_t i = 1; i < expected_shape.size(); ++i) {
+      if (actual_shape[i] != expected_shape[i]) {
+        std::vector<int64_t> batch_expected = expected_shape;
+        batch_expected[0] = actual_shape[0];
+        throw std::runtime_error(
+            "Batch input '" + input_name + "' shape mismatch: expected " +
+            shape_to_string(batch_expected) + ", got " +
+            shape_to_string(actual_shape));
+      }
+    }
+  } else {
+    require_shape_matches(actual_shape, expected_shape,
+                          "Input '" + input_name + "'");
   }
   std::array<uint32_t, RKNN_MAX_DIMS> dims = {};
   for (ssize_t i = 0; i < array.ndim(); ++i) {
@@ -913,7 +943,7 @@ private:
                                  " inputs, but a single array was given");
       }
       py::array arr = ensure_array(input_feed, 0);
-      return {parse_array(arr, input_attrs_[0].n_dims, allow_batch)};
+      return {parse_array(arr, input_attrs_[0], allow_batch, input_names_[0])};
     }
 
     if (py::isinstance<py::dict>(input_feed)) {
@@ -931,7 +961,8 @@ private:
           throw std::runtime_error("Missing input: " + input_names_[i]);
         }
         py::array arr = ensure_array(d[key], i);
-        inputs.push_back(parse_array(arr, input_attrs_[i].n_dims, allow_batch));
+        inputs.push_back(
+            parse_array(arr, input_attrs_[i], allow_batch, input_names_[i]));
       }
       return inputs;
     }
@@ -948,7 +979,8 @@ private:
       inputs.reserve(expected_inputs);
       for (size_t i = 0; i < expected_inputs; ++i) {
         py::array arr = ensure_array(seq[i], i);
-        inputs.push_back(parse_array(arr, input_attrs_[i].n_dims, allow_batch));
+        inputs.push_back(
+            parse_array(arr, input_attrs_[i], allow_batch, input_names_[i]));
       }
       return inputs;
     }
@@ -1332,7 +1364,8 @@ PYBIND11_MODULE(_core, m) {
               std::string name = py::cast<std::string>(name_obj);
               std::string io_kind = py::cast<std::string>(io_kind_obj);
               return session->zero_copy_backend()->create_value_for_io(
-                  name, io_kind, element_type, parse_mem_flags(mem_flags_obj));
+                  name, io_kind, element_type, parse_mem_flags(mem_flags_obj),
+                  shape);
             }
             return RknnOrtValue::create_generic_rknn(
                 std::move(shape), element_type, parse_mem_flags(mem_flags_obj));
@@ -1348,8 +1381,8 @@ PYBIND11_MODULE(_core, m) {
              uint32_t size, int32_t offset, py::object virt_addr_obj,
              py::object session_obj, py::object name_obj, py::object io_kind_obj,
              const std::string &layout) {
-            (void)shape_obj;
             (void)layout;
+            std::vector<int64_t> shape = parse_shape_like(shape_obj, false);
             if (session_obj.is_none() || name_obj.is_none() ||
                 io_kind_obj.is_none()) {
               throw std::runtime_error(
@@ -1365,7 +1398,7 @@ PYBIND11_MODULE(_core, m) {
                 py::cast<std::string>(name_obj),
                 py::cast<std::string>(io_kind_obj),
                 dtype_like_to_rknn(element_type_obj, false),
-                static_cast<int32_t>(fd), virt_addr, size, offset);
+                static_cast<int32_t>(fd), virt_addr, size, offset, shape);
           },
           py::arg("fd"), py::arg("shape"), py::arg("element_type"),
           py::kw_only(), py::arg("size"), py::arg("offset") = 0,

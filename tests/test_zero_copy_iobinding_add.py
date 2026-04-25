@@ -260,3 +260,64 @@ def test_zero_copy_iobinding_honors_nhwc_session_layout(rknn_model_factory):
 
     assert actual.shape == expected.shape
     np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def test_zero_copy_iobinding_rejects_shape_and_native_layout_mismatch(
+    rknn_model_factory,
+):
+    dtype = np.float16
+    model_shape = _shape_for(4, dtype, channel=8)
+    model_path = rknn_model_factory(
+        4, "nhwc8", "fp16_nhwc_mismatch", model_shape, TensorProto.FLOAT16
+    )
+    session = ezrknn.InferenceSession(model_path, provider_options={"layout": "nhwc"})
+    shape = tuple(session.get_inputs()[0].shape)
+    wrong_shape = shape[:-1] + (shape[-1] + 1,)
+
+    x, y = _make_inputs(shape, dtype)
+    wrong_x = np.zeros(wrong_shape, dtype=dtype)
+    with pytest.raises(RuntimeError, match="Input 'x' shape mismatch"):
+        session.run(None, {"x": wrong_x, "y": y})
+
+    with pytest.raises(RuntimeError, match="OrtValue for input 'x' shape mismatch"):
+        ezrknn.OrtValue.ortvalue_from_shape_and_type(
+            wrong_shape,
+            dtype,
+            "rknpu2",
+            session=session,
+            name="x",
+            io_kind="input",
+        )
+
+    with pytest.raises(
+        RuntimeError, match="OrtValue for input 'x' element type mismatch"
+    ):
+        ezrknn.OrtValue.ortvalue_from_shape_and_type(
+            shape,
+            np.float32,
+            "rknpu2",
+            session=session,
+            name="x",
+            io_kind="input",
+        )
+
+    binding = session.io_binding()
+    generic_input = ezrknn.OrtValue.ortvalue_from_shape_and_type(
+        shape, dtype, "rknpu2"
+    )
+    with pytest.raises(RuntimeError, match="native zero-copy layout mismatch"):
+        binding.bind_ortvalue_input("x", generic_input)
+
+    wrong_output = ezrknn.OrtValue.ortvalue_from_shape_and_type(
+        wrong_shape, dtype, "rknpu2"
+    )
+    with pytest.raises(RuntimeError, match="OrtValue for output 'z' shape mismatch"):
+        binding.bind_ortvalue_output("z", wrong_output)
+
+    with pytest.raises(RuntimeError, match="OrtValue for output 'z' shape mismatch"):
+        binding.bind_output("z", "rknpu2", shape=wrong_shape)
+
+    with pytest.raises(
+        RuntimeError, match="OrtValue for output 'z' element type mismatch"
+    ):
+        binding.bind_output("z", "rknpu2", element_type=np.float32)

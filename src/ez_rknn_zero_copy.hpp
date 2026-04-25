@@ -116,6 +116,179 @@ inline std::vector<int64_t> attr_shape_i64(const rknn_tensor_attr &attr) {
   return shape;
 }
 
+inline std::string shape_to_string(const std::vector<int64_t> &shape) {
+  std::string text = "[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i > 0) {
+      text += ", ";
+    }
+    text += std::to_string(shape[i]);
+  }
+  text += "]";
+  return text;
+}
+
+inline void require_shape_matches(const std::vector<int64_t> &actual,
+                                  const std::vector<int64_t> &expected,
+                                  const std::string &context) {
+  if (actual != expected) {
+    throw std::runtime_error(context + " shape mismatch: expected " +
+                             shape_to_string(expected) + ", got " +
+                             shape_to_string(actual));
+  }
+}
+
+inline std::vector<int64_t> numpy_shape_i64(const py::array &array) {
+  std::vector<int64_t> shape;
+  shape.reserve(array.ndim());
+  for (ssize_t i = 0; i < array.ndim(); ++i) {
+    shape.push_back(static_cast<int64_t>(array.shape(i)));
+  }
+  return shape;
+}
+
+inline std::string rknn_tensor_type_name(rknn_tensor_type type) {
+  switch (type) {
+  case RKNN_TENSOR_FLOAT32:
+    return "float32";
+  case RKNN_TENSOR_FLOAT16:
+    return "float16";
+  case RKNN_TENSOR_INT8:
+    return "int8";
+  case RKNN_TENSOR_UINT8:
+    return "uint8";
+  case RKNN_TENSOR_INT16:
+    return "int16";
+  case RKNN_TENSOR_UINT16:
+    return "uint16";
+  case RKNN_TENSOR_INT32:
+    return "int32";
+  case RKNN_TENSOR_UINT32:
+    return "uint32";
+  case RKNN_TENSOR_INT64:
+    return "int64";
+  case RKNN_TENSOR_BOOL:
+    return "bool";
+  default:
+    return "unknown(" + std::to_string(static_cast<int>(type)) + ")";
+  }
+}
+
+inline void require_type_matches(rknn_tensor_type actual,
+                                 rknn_tensor_type expected,
+                                 const std::string &context) {
+  if (actual != expected) {
+    throw std::runtime_error(context + " element type mismatch: expected " +
+                             rknn_tensor_type_name(expected) + ", got " +
+                             rknn_tensor_type_name(actual));
+  }
+}
+
+inline void append_attr_mismatch(std::vector<std::string> &items,
+                                 const std::string &name,
+                                 uint64_t actual, uint64_t expected) {
+  if (actual != expected) {
+    items.push_back(name + " expected " + std::to_string(expected) +
+                    ", got " + std::to_string(actual));
+  }
+}
+
+inline void append_attr_mismatch_signed(std::vector<std::string> &items,
+                                        const std::string &name,
+                                        int64_t actual, int64_t expected) {
+  if (actual != expected) {
+    items.push_back(name + " expected " + std::to_string(expected) +
+                    ", got " + std::to_string(actual));
+  }
+}
+
+inline uint32_t attr_width_stride_value(const rknn_tensor_attr &attr) {
+  if (attr.w_stride > 0) {
+    return attr.w_stride;
+  }
+  if (attr.n_dims == 4 && attr.fmt == RKNN_TENSOR_NHWC) {
+    return attr.dims[2];
+  }
+  if (attr.n_dims == 4 && attr.fmt == RKNN_TENSOR_NCHW) {
+    return attr.dims[3];
+  }
+  return 0;
+}
+
+inline uint32_t attr_height_stride_value(const rknn_tensor_attr &attr) {
+  if (attr.h_stride > 0) {
+    return attr.h_stride;
+  }
+  if (attr.n_dims == 4 && attr.fmt == RKNN_TENSOR_NHWC) {
+    return attr.dims[1];
+  }
+  if (attr.n_dims == 4 && attr.fmt == RKNN_TENSOR_NCHW) {
+    return attr.dims[2];
+  }
+  return 0;
+}
+
+inline std::string native_attr_mismatch_reason(const rknn_tensor_attr &actual,
+                                               const rknn_tensor_attr &expected) {
+  std::vector<std::string> items;
+  append_attr_mismatch(items, "type", static_cast<uint64_t>(actual.type),
+                       static_cast<uint64_t>(expected.type));
+  append_attr_mismatch(items, "n_dims", actual.n_dims, expected.n_dims);
+  const uint32_t dims_to_compare = std::max(actual.n_dims, expected.n_dims);
+  for (uint32_t i = 0; i < dims_to_compare && i < RKNN_MAX_DIMS; ++i) {
+    append_attr_mismatch(items, "dims[" + std::to_string(i) + "]",
+                         actual.dims[i], expected.dims[i]);
+  }
+  append_attr_mismatch(items, "fmt", static_cast<uint64_t>(actual.fmt),
+                       static_cast<uint64_t>(expected.fmt));
+  append_attr_mismatch(items, "n_elems", actual.n_elems, expected.n_elems);
+  append_attr_mismatch(items, "size", actual.size, expected.size);
+  append_attr_mismatch(items, "size_with_stride", actual.size_with_stride,
+                       expected.size_with_stride);
+  append_attr_mismatch(items, "w_stride", attr_width_stride_value(actual),
+                       attr_width_stride_value(expected));
+  append_attr_mismatch(items, "h_stride", attr_height_stride_value(actual),
+                       attr_height_stride_value(expected));
+  append_attr_mismatch(items, "pass_through", actual.pass_through,
+                       expected.pass_through);
+  append_attr_mismatch(items, "qnt_type", static_cast<uint64_t>(actual.qnt_type),
+                       static_cast<uint64_t>(expected.qnt_type));
+  append_attr_mismatch_signed(items, "fl", static_cast<int64_t>(actual.fl),
+                              static_cast<int64_t>(expected.fl));
+  append_attr_mismatch_signed(items, "zp", static_cast<int64_t>(actual.zp),
+                              static_cast<int64_t>(expected.zp));
+  if (actual.scale != expected.scale) {
+    items.push_back("scale expected " + std::to_string(expected.scale) +
+                    ", got " + std::to_string(actual.scale));
+  }
+  if (items.empty()) {
+    return "";
+  }
+  std::string reason;
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (i > 0) {
+      reason += "; ";
+    }
+    reason += items[i];
+  }
+  return reason;
+}
+
+inline void require_native_attr_matches(const rknn_tensor_attr &actual,
+                                        const rknn_tensor_attr &expected,
+                                        const std::string &context) {
+  const std::string reason = native_attr_mismatch_reason(actual, expected);
+  if (!reason.empty()) {
+    throw std::runtime_error(
+        context +
+        " native zero-copy layout mismatch: " + reason +
+        ". The OrtValue buffer was written using a different RKNN native "
+        "layout than this model input expects. Create the OrtValue with this "
+        "consumer session/name/io_kind, or use a copy/transpose path instead "
+        "of binding the dmabuf directly.");
+  }
+}
+
 inline uint32_t attr_dense_bytes(const rknn_tensor_attr &attr) {
   return static_cast<uint32_t>(attr.n_elems * rknn_tensor_type_size(attr.type));
 }
@@ -478,8 +651,51 @@ public:
   rknn_tensor_type element_type() const { return type_; }
   const rknn_tensor_attr &attr() const { return attr_; }
 
-  void apply_binding_attr(const rknn_tensor_attr &native_attr,
-                          const rknn_tensor_attr &logical_attr) {
+  void apply_input_binding_attr(const rknn_tensor_attr &native_attr,
+                                const rknn_tensor_attr &logical_attr,
+                                const std::string &name) {
+    const std::vector<int64_t> expected_shape = attr_shape_i64(logical_attr);
+    require_shape_matches(shape_, expected_shape,
+                          "OrtValue for input '" + name + "'");
+    require_type_matches(type_, logical_attr.type,
+                         "OrtValue for input '" + name + "'");
+    require_native_attr_matches(attr_, native_attr,
+                                "OrtValue for input '" + name + "'");
+    require_buffer_size_for_attr(native_attr);
+    attr_ = native_attr;
+    shape_ = expected_shape;
+    type_ = logical_attr.type;
+  }
+
+  void apply_output_binding_attr(const rknn_tensor_attr &native_attr,
+                                 const rknn_tensor_attr &logical_attr,
+                                 const std::string &name) {
+    const std::vector<int64_t> expected_shape = attr_shape_i64(logical_attr);
+    require_shape_matches(shape_, expected_shape,
+                          "OrtValue for output '" + name + "'");
+    require_type_matches(type_, logical_attr.type,
+                         "OrtValue for output '" + name + "'");
+    require_buffer_size_for_attr(native_attr);
+    attr_ = native_attr;
+    shape_ = expected_shape;
+    type_ = logical_attr.type;
+  }
+
+  void require_update_source_compatible(const py::array &source) const {
+    require_shape_matches(numpy_shape_i64(source), shape_,
+                          "update_inplace source");
+    py::dtype expected_dtype = rknn_tensor_type_to_numpy_dtype(type_);
+    py::object dtype_matches =
+        source.attr("dtype").attr("__eq__")(expected_dtype);
+    if (!py::cast<bool>(dtype_matches)) {
+      throw std::runtime_error(
+          "update_inplace source element type mismatch: expected " +
+          std::string(py::str(expected_dtype)) + ", got " +
+          std::string(py::str(source.attr("dtype"))));
+    }
+  }
+
+  void require_buffer_size_for_attr(const rknn_tensor_attr &native_attr) const {
     const uint32_t required = attr_alloc_bytes(native_attr);
     if (backing_size() < required) {
       throw std::runtime_error(
@@ -492,9 +708,6 @@ public:
           ", size_with_stride=" +
           std::to_string(native_attr.size_with_stride) + ")");
     }
-    attr_ = native_attr;
-    shape_ = attr_shape_i64(logical_attr);
-    type_ = logical_attr.type;
   }
 
   uintptr_t data_ptr() const {
@@ -602,6 +815,16 @@ public:
       if (!contiguous) {
         throw std::runtime_error("source must be a contiguous numpy array");
       }
+      require_shape_matches(numpy_shape_i64(contiguous), shape_,
+                            "update_inplace source");
+      py::object dtype_matches =
+          contiguous.attr("dtype").attr("__eq__")(cpu_array_.attr("dtype"));
+      if (!py::cast<bool>(dtype_matches)) {
+        throw std::runtime_error(
+            "update_inplace source element type mismatch: expected " +
+            std::string(py::str(cpu_array_.attr("dtype"))) + ", got " +
+            std::string(py::str(contiguous.attr("dtype"))));
+      }
       if (contiguous.nbytes() != cpu_array_.nbytes()) {
         throw std::runtime_error("source byte size does not match OrtValue");
       }
@@ -617,6 +840,7 @@ public:
     if (!contiguous) {
       throw std::runtime_error("source must be a contiguous numpy array");
     }
+    require_update_source_compatible(contiguous);
     const size_t source_bytes = static_cast<size_t>(contiguous.nbytes());
     const size_t dense = attr_dense_bytes(attr_);
     const size_t alloc = attr_alloc_bytes(attr_);
@@ -930,7 +1154,9 @@ public:
 
   std::shared_ptr<RknnOrtValue>
   create_value_for_io(const std::string &name, const std::string &io_kind,
-                      rknn_tensor_type type, uint64_t alloc_flags) {
+                      rknn_tensor_type type, uint64_t alloc_flags,
+                      const std::optional<std::vector<int64_t>> &requested_shape =
+                          std::nullopt) {
     const bool is_input = io_kind == "input";
     const bool is_output = io_kind == "output";
     if (!is_input && !is_output) {
@@ -940,14 +1166,13 @@ public:
         is_input ? native_input_attr(name) : native_output_attr(name);
     rknn_tensor_attr logical =
         is_input ? logical_input_attr(name) : logical_output_attr(name);
+    const std::string context = "OrtValue for " + io_kind + " '" + name + "'";
+    const std::vector<int64_t> expected_shape = attr_shape_i64(logical);
+    if (requested_shape.has_value()) {
+      require_shape_matches(requested_shape.value(), expected_shape, context);
+    }
     if (type != RKNN_TENSOR_TYPE_MAX) {
-      attr.type = type;
-      logical.type = type;
-      attr.size = static_cast<uint32_t>(attr.n_elems *
-                                        rknn_tensor_type_size(attr.type));
-      if (attr.size_with_stride == 0 || attr.size_with_stride < attr.size) {
-        attr.size_with_stride = attr.size;
-      }
+      require_type_matches(type, logical.type, context);
     }
     return RknnOrtValue::create_rknn(holder_, attr, attr_shape_i64(logical),
                                      logical.type, alloc_flags);
@@ -956,7 +1181,9 @@ public:
   std::shared_ptr<RknnOrtValue>
   create_value_from_fd(const std::string &name, const std::string &io_kind,
                        rknn_tensor_type type, int32_t fd, void *virt_addr,
-                       uint32_t size, int32_t offset) {
+                       uint32_t size, int32_t offset,
+                       const std::optional<std::vector<int64_t>> &requested_shape =
+                           std::nullopt) {
     const bool is_input = io_kind == "input";
     const bool is_output = io_kind == "output";
     if (!is_input && !is_output) {
@@ -966,10 +1193,13 @@ public:
         is_input ? native_input_attr(name) : native_output_attr(name);
     rknn_tensor_attr logical =
         is_input ? logical_input_attr(name) : logical_output_attr(name);
-    if (type != RKNN_TENSOR_TYPE_MAX) {
-      attr.type = type;
-      logical.type = type;
+    const std::string context = "OrtValue from dmabuf for " + io_kind + " '" +
+                                name + "'";
+    const std::vector<int64_t> expected_shape = attr_shape_i64(logical);
+    if (requested_shape.has_value()) {
+      require_shape_matches(requested_shape.value(), expected_shape, context);
     }
+    require_type_matches(type, logical.type, context);
     return RknnOrtValue::from_fd(holder_, fd, virt_addr, size, offset, attr,
                                  attr_shape_i64(logical), logical.type);
   }
@@ -1157,8 +1387,8 @@ public:
       throw std::runtime_error("bind_ortvalue_input requires an RKNN OrtValue");
     }
     const size_t idx = session_->input_index(name);
-    value->apply_binding_attr(session_->native_input_attrs().at(idx),
-                              session_->input_attrs().at(idx));
+    value->apply_input_binding_attr(session_->native_input_attrs().at(idx),
+                                    session_->input_attrs().at(idx), name);
     bound_inputs_[idx] = std::move(value);
   }
 
@@ -1168,8 +1398,8 @@ public:
       throw std::runtime_error("bind_ortvalue_output requires an RKNN OrtValue");
     }
     const size_t idx = session_->output_index(name);
-    value->apply_binding_attr(session_->native_output_attrs().at(idx),
-                              session_->output_attrs().at(idx));
+    value->apply_output_binding_attr(session_->native_output_attrs().at(idx),
+                                     session_->output_attrs().at(idx), name);
     bound_outputs_[idx] = std::move(value);
     remember_output_order(idx);
   }
@@ -1190,7 +1420,7 @@ public:
     }
     auto value = session_->create_value_for_io(
         name, "output", element_type.value_or(RKNN_TENSOR_TYPE_MAX),
-        alloc_flags);
+        alloc_flags, shape);
     const size_t idx = session_->output_index(name);
     bound_outputs_[idx] = std::move(value);
     if (device_type == "cpu") {
