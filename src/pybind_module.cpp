@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "ez_rknn_async.hpp"
+#include "ez_rknn_zero_copy.hpp"
 
 namespace py = pybind11;
 
@@ -33,6 +34,10 @@ namespace {
 
 constexpr int64_t kDefaultSubmitTimeoutMs = 10000;
 using ztu::rk::AsyncEzRknn;
+using ztu::rk::RknnIoBinding;
+using ztu::rk::RknnOrtValue;
+using ztu::rk::ZeroCopyEzRknn;
+using ztu::rk::rknn_tensor_type_to_numpy_dtype;
 
 struct ParsedInput {
   py::array array;
@@ -196,6 +201,64 @@ bool parse_bool_like(py::handle value, const char *name) {
     }
   }
   throw std::runtime_error(std::string(name) + " must be a boolean");
+}
+
+rknn_tensor_type dtype_like_to_rknn(py::handle value,
+                                    bool allow_none = false) {
+  if (allow_none && value.is_none()) {
+    return RKNN_TENSOR_TYPE_MAX;
+  }
+  py::dtype dtype =
+      py::dtype::from_args(py::reinterpret_borrow<py::object>(value));
+  return dtype_to_rknn(dtype);
+}
+
+uint64_t parse_mem_flags(py::handle value) {
+  if (value.is_none()) {
+    return RKNN_FLAG_MEMORY_FLAGS_DEFAULT;
+  }
+  if (py::isinstance<py::int_>(value)) {
+    return static_cast<uint64_t>(py::cast<int64_t>(value));
+  }
+  if (!py::isinstance<py::str>(value)) {
+    throw std::runtime_error("mem_flags must be a string, integer, or None");
+  }
+  std::string text = trim_string(py::cast<std::string>(value));
+  for (auto &c : text) {
+    c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+  }
+  if (text == "default" || text == "cacheable") {
+    return RKNN_FLAG_MEMORY_FLAGS_DEFAULT;
+  }
+  if (text == "non_cacheable" || text == "non-cacheable" ||
+      text == "uncached") {
+    return RKNN_FLAG_MEMORY_NON_CACHEABLE;
+  }
+  if (text == "try_sram" || text == "sram") {
+    return RKNN_FLAG_MEMORY_TRY_ALLOC_SRAM;
+  }
+  throw std::runtime_error(
+      "mem_flags must be one of: default, cacheable, non_cacheable, try_sram");
+}
+
+std::vector<int64_t> parse_shape_like(py::handle value, bool allow_none) {
+  if (allow_none && value.is_none()) {
+    return {};
+  }
+  if (!py::isinstance<py::sequence>(value)) {
+    throw std::runtime_error("shape must be a sequence of integers");
+  }
+  py::sequence seq = value.cast<py::sequence>();
+  std::vector<int64_t> shape;
+  shape.reserve(seq.size());
+  for (auto item : seq) {
+    int64_t dim = parse_int_like(item, "shape dim");
+    if (dim < 0) {
+      throw std::runtime_error("shape dims must be >= 0");
+    }
+    shape.push_back(dim);
+  }
+  return shape;
 }
 
 std::vector<uint64_t> parse_schedule_like(py::handle value) {
@@ -582,7 +645,7 @@ public:
   }
 
   InferenceSession(const std::string &model_path, const SessionConfig &config)
-      : pipeline_depth_(0), pipeline_initialized_(false),
+      : model_path_(model_path), pipeline_depth_(0), pipeline_initialized_(false),
         nchw_software_(false),
         submit_timeout_(std::chrono::milliseconds(config.submit_timeout_ms)) {
     const bool has_custom_op_request =
@@ -792,6 +855,37 @@ public:
       info.custom_metadata_map.emplace("rknn_custom_string", custom_string);
     }
     return info;
+  }
+
+  std::shared_ptr<RknnIoBinding> io_binding() {
+    return std::make_shared<RknnIoBinding>(zero_copy_backend());
+  }
+
+  void run_with_iobinding(RknnIoBinding &binding, py::object run_options) {
+    (void)run_options;
+    auto backend = zero_copy_backend();
+    py::gil_scoped_release release;
+    backend->run_with_iobinding(binding);
+  }
+
+  std::vector<NodeArgInfo> get_native_inputs() {
+    auto backend = zero_copy_backend();
+    return build_node_args(backend->native_input_attrs(),
+                           backend->input_names());
+  }
+
+  std::vector<NodeArgInfo> get_native_outputs() {
+    auto backend = zero_copy_backend();
+    return build_node_args(backend->native_output_attrs(),
+                           backend->output_names());
+  }
+
+  std::shared_ptr<ZeroCopyEzRknn> zero_copy_backend() {
+    std::lock_guard<std::mutex> lock(zero_copy_mutex_);
+    if (!zero_copy_) {
+      zero_copy_ = std::make_shared<ZeroCopyEzRknn>(model_path_);
+    }
+    return zero_copy_;
   }
 
 private:
@@ -1116,6 +1210,9 @@ private:
   }
 
   std::unique_ptr<AsyncEzRknn> rknn_;
+  std::string model_path_;
+  std::shared_ptr<ZeroCopyEzRknn> zero_copy_;
+  std::mutex zero_copy_mutex_;
   std::vector<rknn_tensor_attr> input_attrs_;
   std::vector<rknn_tensor_attr> output_attrs_;
   std::vector<std::string> input_names_;
@@ -1149,6 +1246,201 @@ PYBIND11_MODULE(_core, m) {
                                return info.custom_metadata_map;
                              },
                              "Additional model metadata from RKNN runtime.");
+
+  py::class_<RknnOrtValue, std::shared_ptr<RknnOrtValue>>(m, "OrtValue")
+      .def_static(
+          "ortvalue_from_numpy",
+          [](py::array array, const std::string &device_type, int device_id,
+             py::object name_obj, py::object session_obj,
+             py::object io_kind_obj, const std::string &layout, bool sync) {
+            (void)device_id;
+            (void)layout;
+            (void)sync;
+            py::array contiguous = py::array::ensure(array, py::array::c_style);
+            if (!contiguous) {
+              throw std::runtime_error("arr must be a contiguous numpy array");
+            }
+            if (device_type == "cpu") {
+              return RknnOrtValue::from_cpu_array(contiguous);
+            }
+            if (device_type != "rknpu2") {
+              throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
+            }
+            if (session_obj.is_none() || name_obj.is_none() ||
+                io_kind_obj.is_none()) {
+              throw std::runtime_error(
+                  "session, name, and io_kind are required for RKNN OrtValue");
+            }
+            auto *session = session_obj.cast<InferenceSession *>();
+            std::string name = py::cast<std::string>(name_obj);
+            std::string io_kind = py::cast<std::string>(io_kind_obj);
+            auto value = session->zero_copy_backend()->create_value_for_io(
+                name, io_kind, dtype_to_rknn(contiguous.dtype()),
+                RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
+            value->update_inplace(contiguous);
+            return value;
+          },
+          py::arg("arr"), py::arg("device_type") = "cpu",
+          py::arg("device_id") = 0, py::kw_only(),
+          py::arg("name") = py::none(), py::arg("session") = py::none(),
+          py::arg("io_kind") = py::none(), py::arg("layout") = "onnx",
+          py::arg("sync") = true)
+      .def_static(
+          "ortvalue_from_shape_and_type",
+          [](py::object shape_obj, py::object element_type_obj,
+             const std::string &device_type, int device_id, py::object name_obj,
+             py::object session_obj, py::object io_kind_obj,
+             const std::string &layout, py::object mem_flags_obj) {
+            (void)device_id;
+            (void)layout;
+            std::vector<int64_t> shape = parse_shape_like(shape_obj, false);
+            rknn_tensor_type element_type =
+                dtype_like_to_rknn(element_type_obj, false);
+            if (device_type == "cpu") {
+              py::array array(rknn_tensor_type_to_numpy_dtype(element_type),
+                              shape);
+              std::memset(array.mutable_data(), 0,
+                          static_cast<size_t>(array.nbytes()));
+              return RknnOrtValue::from_cpu_array(array);
+            }
+            if (device_type != "rknpu2") {
+              throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
+            }
+            if (!session_obj.is_none() && !name_obj.is_none() &&
+                !io_kind_obj.is_none()) {
+              auto *session = session_obj.cast<InferenceSession *>();
+              std::string name = py::cast<std::string>(name_obj);
+              std::string io_kind = py::cast<std::string>(io_kind_obj);
+              return session->zero_copy_backend()->create_value_for_io(
+                  name, io_kind, element_type, parse_mem_flags(mem_flags_obj));
+            }
+            return RknnOrtValue::create_generic_rknn(
+                std::move(shape), element_type, parse_mem_flags(mem_flags_obj));
+          },
+          py::arg("shape"), py::arg("element_type"),
+          py::arg("device_type") = "cpu", py::arg("device_id") = 0,
+          py::kw_only(), py::arg("name") = py::none(),
+          py::arg("session") = py::none(), py::arg("io_kind") = py::none(),
+          py::arg("layout") = "native", py::arg("mem_flags") = "cacheable")
+      .def_static(
+          "ortvalue_from_dmabuf",
+          [](int fd, py::object shape_obj, py::object element_type_obj,
+             uint32_t size, int32_t offset, py::object virt_addr_obj,
+             py::object session_obj, py::object name_obj, py::object io_kind_obj,
+             const std::string &layout) {
+            (void)shape_obj;
+            (void)layout;
+            if (session_obj.is_none() || name_obj.is_none() ||
+                io_kind_obj.is_none()) {
+              throw std::runtime_error(
+                  "session, name, and io_kind are required for dma-buf OrtValue");
+            }
+            void *virt_addr = nullptr;
+            if (!virt_addr_obj.is_none()) {
+              virt_addr = reinterpret_cast<void *>(
+                  static_cast<uintptr_t>(py::cast<uint64_t>(virt_addr_obj)));
+            }
+            auto *session = session_obj.cast<InferenceSession *>();
+            return session->zero_copy_backend()->create_value_from_fd(
+                py::cast<std::string>(name_obj),
+                py::cast<std::string>(io_kind_obj),
+                dtype_like_to_rknn(element_type_obj, false),
+                static_cast<int32_t>(fd), virt_addr, size, offset);
+          },
+          py::arg("fd"), py::arg("shape"), py::arg("element_type"),
+          py::kw_only(), py::arg("size"), py::arg("offset") = 0,
+          py::arg("virt_addr") = py::none(), py::arg("session") = py::none(),
+          py::arg("name") = py::none(), py::arg("io_kind") = py::none(),
+          py::arg("layout") = "native",
+          "Create an RKNN OrtValue from a Linux dma-buf file descriptor.")
+      .def("numpy", &RknnOrtValue::numpy)
+      .def("update_inplace", &RknnOrtValue::update_inplace, py::arg("np_arr"))
+      .def("data_ptr", &RknnOrtValue::data_ptr)
+      .def("device_name", &RknnOrtValue::device_name)
+      .def("device_type", &RknnOrtValue::device_type)
+      .def("device_id", &RknnOrtValue::device_id)
+      .def("shape", &RknnOrtValue::shape)
+      .def("element_type",
+           [](const RknnOrtValue &value) {
+             return rknn_type_to_onnx_str(value.element_type());
+           })
+      .def("is_tensor", &RknnOrtValue::is_tensor)
+      .def("has_value", &RknnOrtValue::has_value)
+      .def("sync_to_device", [](RknnOrtValue &value) {
+        value.sync_to_device();
+      })
+      .def("sync_from_device", [](RknnOrtValue &value) {
+        value.sync_from_device();
+      })
+      .def("memory_info", &RknnOrtValue::memory_info);
+
+  py::class_<RknnIoBinding, std::shared_ptr<RknnIoBinding>>(m,
+                                                            "SessionIOBinding")
+      .def("bind_cpu_input", &RknnIoBinding::bind_cpu_input, py::arg("name"),
+           py::arg("arr_on_cpu"))
+      .def(
+          "bind_input",
+          [](RknnIoBinding &binding, const std::string &name,
+             const std::string &device_type, int device_id,
+             py::object element_type, py::object shape, py::object buffer_ptr) {
+            (void)binding;
+            (void)name;
+            (void)device_type;
+            (void)device_id;
+            (void)element_type;
+            (void)shape;
+            (void)buffer_ptr;
+            throw std::runtime_error(
+                "bind_input with raw buffer_ptr is not supported for RKNN "
+                "device memory because RKNN zero-copy requires a dma-buf fd "
+                "and a per-context rknn_create_mem_from_fd import. Use "
+                "bind_cpu_input for CPU arrays, bind_ortvalue_input for RKNN "
+                "OrtValue, or OrtValue.ortvalue_from_dmabuf for external "
+                "dma-buf memory.");
+          },
+          py::arg("name"), py::arg("device_type"), py::arg("device_id"),
+          py::arg("element_type"), py::arg("shape"), py::arg("buffer_ptr"))
+      .def("bind_ortvalue_input", &RknnIoBinding::bind_ortvalue_input,
+           py::arg("name"), py::arg("ortvalue"))
+      .def("bind_ortvalue_output", &RknnIoBinding::bind_ortvalue_output,
+           py::arg("name"), py::arg("ortvalue"))
+      .def(
+          "bind_output",
+          [](RknnIoBinding &binding, const std::string &name,
+             const std::string &device_type, int device_id,
+             py::object element_type_obj, py::object shape_obj,
+             py::object buffer_ptr_obj, const std::string &layout,
+             py::object mem_flags_obj) {
+            (void)layout;
+            std::optional<rknn_tensor_type> element_type;
+            if (!element_type_obj.is_none()) {
+              element_type = dtype_like_to_rknn(element_type_obj, false);
+            }
+            std::optional<std::vector<int64_t>> shape;
+            if (!shape_obj.is_none()) {
+              shape = parse_shape_like(shape_obj, false);
+            }
+            std::optional<uint64_t> buffer_ptr;
+            if (!buffer_ptr_obj.is_none()) {
+              buffer_ptr = py::cast<uint64_t>(buffer_ptr_obj);
+            }
+            binding.bind_output(name, device_type, device_id, element_type,
+                                shape, buffer_ptr,
+                                parse_mem_flags(mem_flags_obj));
+          },
+          py::arg("name"), py::arg("device_type") = "cpu",
+          py::arg("device_id") = 0, py::arg("element_type") = py::none(),
+          py::arg("shape") = py::none(), py::arg("buffer_ptr") = py::none(),
+          py::kw_only(), py::arg("layout") = "native",
+          py::arg("mem_flags") = "cacheable")
+      .def("get_outputs", &RknnIoBinding::get_outputs)
+      .def("copy_outputs_to_cpu", &RknnIoBinding::copy_outputs_to_cpu)
+      .def("clear_binding_inputs", &RknnIoBinding::clear_binding_inputs)
+      .def("clear_binding_outputs", &RknnIoBinding::clear_binding_outputs)
+      .def("synchronize_inputs", &RknnIoBinding::synchronize_inputs)
+      .def("synchronize_outputs", &RknnIoBinding::synchronize_outputs);
+
+  m.attr("IOBinding") = m.attr("SessionIOBinding");
 
   py::class_<InferenceSession>(m, "InferenceSession")
       .def(py::init([](py::object path_or_bytes, py::object sess_options,
@@ -1187,12 +1479,21 @@ PYBIND11_MODULE(_core, m) {
            "Pipeline mode. Returns None until the pipeline is filled, then "
            "returns\n"
            "the oldest pending result. Use reset=True to clear the pipeline.")
+      .def("io_binding", &InferenceSession::io_binding,
+           "Create an ORT-style SessionIOBinding for RKNN zero-copy runs.")
+      .def("run_with_iobinding", &InferenceSession::run_with_iobinding,
+           py::arg("io_binding"), py::arg("run_options") = py::none(),
+           "Run inference with ORT-style I/O binding.")
       .def("get_inputs", &InferenceSession::get_inputs,
            "Return input NodeArg list (onnxruntime-style).")
       .def("get_modelmeta", &InferenceSession::get_modelmeta,
            "Return model metadata (onnxruntime-style).")
       .def("get_outputs", &InferenceSession::get_outputs,
            "Return output NodeArg list (onnxruntime-style).")
+      .def("get_native_inputs", &InferenceSession::get_native_inputs,
+           "Return RKNN native input NodeArg list for zero-copy binding.")
+      .def("get_native_outputs", &InferenceSession::get_native_outputs,
+           "Return RKNN native output NodeArg list for zero-copy binding.")
       .def_property_readonly("input_names", &InferenceSession::input_names)
       .def_property_readonly("output_names", &InferenceSession::output_names);
 

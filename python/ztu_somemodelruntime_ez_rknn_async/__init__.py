@@ -3,7 +3,7 @@
 from pathlib import Path
 import re
 
-from ._core import InferenceSession, ModelMetadata, NodeArg
+from ._core import IOBinding, InferenceSession, ModelMetadata, NodeArg, OrtValue, SessionIOBinding
 from .options import RknnProviderOptions, make_provider_options
 
 try:
@@ -14,9 +14,12 @@ except ImportError:  # pragma: no cover - Python 3.7 fallback
 
 __all__ = [
     "InferenceSession",
+    "IOBinding",
     "ModelMetadata",
     "NodeArg",
+    "OrtValue",
     "RknnProviderOptions",
+    "SessionIOBinding",
     "make_provider_options",
 ]
 

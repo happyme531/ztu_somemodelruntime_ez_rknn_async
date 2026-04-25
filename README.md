@@ -15,6 +15,7 @@ Supported Python versions: 3.7+
 | **Pipeline-based Async Inference** | ✅ Supported | ⚠️ Limited (Depth = 1) |
 | **True Async Inference (Callback/Future)** | ✅ Supported | ❌ Not Supported |
 | **Multi-batch Data Parallel Inference** | ✅ Supported | ⚠️ Limited (Fixed batch/4D only) |
+| **Zero-copy Inference** | ✅ Supported (via OrtValue/io_binding API, EXPERIMENTAL) | ❌ Not Supported |
 | **Custom Operator Plugins** | ✅ Supported | ❌ Not Supported |
 | **Read model embed string** | ✅ Supported | ❌ Not Supported |
 | **API Style** | 🚀 ORT-like (Easy migration) | ⚙️ Proprietary (Complex) |
