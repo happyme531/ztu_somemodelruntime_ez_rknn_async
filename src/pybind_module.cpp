@@ -38,6 +38,7 @@ using ztu::rk::RknnIoBinding;
 using ztu::rk::RknnContextHolder;
 using ztu::rk::RknnOrtValue;
 using ztu::rk::ZeroCopyEzRknn;
+using ztu::rk::ZeroCopyInputLayout;
 using ztu::rk::rknn_tensor_type_to_numpy_dtype;
 
 struct ParsedInput {
@@ -698,9 +699,16 @@ public:
     if (rknn_->contexts.empty() || rknn_->contexts[0] == 0) {
       throw std::runtime_error("Async RKNN context is not available");
     }
+    ZeroCopyInputLayout zero_copy_input_layout = ZeroCopyInputLayout::NCHW;
+    if (layout_lower == "nhwc") {
+      zero_copy_input_layout = ZeroCopyInputLayout::NHWC;
+    } else if (layout_lower == "any") {
+      zero_copy_input_layout = ZeroCopyInputLayout::ANY;
+    }
     auto zero_copy_holder = std::make_shared<RknnContextHolder>(
         rknn_->contexts[0], false, std::static_pointer_cast<void>(rknn_));
-    zero_copy_ = std::make_shared<ZeroCopyEzRknn>(std::move(zero_copy_holder));
+    zero_copy_ = std::make_shared<ZeroCopyEzRknn>(std::move(zero_copy_holder),
+                                                  zero_copy_input_layout);
 
     input_attrs_ = rknn_->input_attrs;
     output_attrs_ = rknn_->output_attrs;
@@ -1279,8 +1287,16 @@ PYBIND11_MODULE(_core, m) {
             std::string name = py::cast<std::string>(name_obj);
             std::string io_kind = py::cast<std::string>(io_kind_obj);
             auto value = session->zero_copy_backend()->create_value_for_io(
-                name, io_kind, dtype_to_rknn(contiguous.dtype()),
+                name, io_kind, RKNN_TENSOR_TYPE_MAX,
                 RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
+            py::dtype target_dtype =
+                rknn_tensor_type_to_numpy_dtype(value->element_type());
+            py::object dtype_matches =
+                contiguous.attr("dtype").attr("__eq__")(target_dtype);
+            if (!py::cast<bool>(dtype_matches)) {
+              contiguous = py::array::ensure(
+                  contiguous.attr("astype")(target_dtype), py::array::c_style);
+            }
             value->update_inplace(contiguous);
             return value;
           },

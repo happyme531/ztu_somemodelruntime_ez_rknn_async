@@ -133,6 +133,101 @@ inline uint32_t attr_alloc_bytes(const rknn_tensor_attr &attr) {
   return attr_dense_bytes(attr);
 }
 
+inline uint32_t attr_width_stride(const rknn_tensor_attr &attr) {
+  if (attr.w_stride > 0) {
+    return attr.w_stride;
+  }
+  if (attr.n_dims == 4 && attr.fmt == RKNN_TENSOR_NHWC) {
+    return attr.dims[2];
+  }
+  if (attr.n_dims == 4 && attr.fmt == RKNN_TENSOR_NCHW) {
+    return attr.dims[3];
+  }
+  return 0;
+}
+
+inline uint32_t attr_height_stride(const rknn_tensor_attr &attr) {
+  if (attr.h_stride > 0) {
+    return attr.h_stride;
+  }
+  if (attr.n_dims == 4 && attr.fmt == RKNN_TENSOR_NHWC) {
+    return attr.dims[1];
+  }
+  if (attr.n_dims == 4 && attr.fmt == RKNN_TENSOR_NCHW) {
+    return attr.dims[2];
+  }
+  return 0;
+}
+
+inline bool supports_native_nhwc_query_type(rknn_tensor_type type) {
+  return type == RKNN_TENSOR_FLOAT32 || type == RKNN_TENSOR_FLOAT16 ||
+         type == RKNN_TENSOR_INT8 || type == RKNN_TENSOR_UINT8;
+}
+
+enum class ZeroCopyInputLayout { NCHW, NHWC, ANY };
+
+inline rknn_tensor_attr
+make_user_input_attr_for_layout(const rknn_tensor_attr &attr,
+                                ZeroCopyInputLayout layout) {
+  if (attr.n_dims != 4) {
+    return attr;
+  }
+  rknn_tensor_attr logical = attr;
+  const uint32_t n = attr.dims[0];
+  if (layout == ZeroCopyInputLayout::NHWC) {
+    return logical;
+  }
+  if (attr.fmt == RKNN_TENSOR_NHWC) {
+    logical.dims[0] = n;
+    logical.dims[1] = attr.dims[3];
+    logical.dims[2] = attr.dims[1];
+    logical.dims[3] = attr.dims[2];
+    logical.fmt = RKNN_TENSOR_NCHW;
+  }
+  return logical;
+}
+
+inline bool can_bind_nc1hwc2_input_as_nhwc(const rknn_tensor_attr &native_attr,
+                                           const rknn_tensor_attr &logical_attr) {
+  return logical_attr.n_dims == 4 && native_attr.fmt == RKNN_TENSOR_NC1HWC2 &&
+         native_attr.pass_through == 0 &&
+         supports_native_nhwc_query_type(native_attr.type);
+}
+
+inline rknn_tensor_attr make_nhwc_input_attr_from_logical(
+    const rknn_tensor_attr &native_attr, const rknn_tensor_attr &logical_attr) {
+  rknn_tensor_attr attr = native_attr;
+  const uint32_t n = logical_attr.dims[0];
+  uint32_t c = logical_attr.dims[1];
+  uint32_t h = logical_attr.dims[2];
+  uint32_t w = logical_attr.dims[3];
+  if (logical_attr.fmt == RKNN_TENSOR_NHWC) {
+    h = logical_attr.dims[1];
+    w = logical_attr.dims[2];
+    c = logical_attr.dims[3];
+  }
+  const uint32_t w_stride = native_attr.w_stride > 0 ? native_attr.w_stride : w;
+  const uint32_t h_stride = native_attr.h_stride > 0 ? native_attr.h_stride : h;
+  attr.n_dims = 4;
+  std::memset(attr.dims, 0, sizeof(attr.dims));
+  attr.dims[0] = n;
+  attr.dims[1] = h;
+  attr.dims[2] = w;
+  attr.dims[3] = c;
+  attr.n_elems = n * h * w * c;
+  attr.fmt = RKNN_TENSOR_NHWC;
+  attr.type = native_attr.type;
+  attr.size =
+      static_cast<uint32_t>(attr.n_elems * rknn_tensor_type_size(attr.type));
+  attr.w_stride = w_stride;
+  attr.h_stride = native_attr.h_stride;
+  attr.size_with_stride = static_cast<uint32_t>(
+      static_cast<uint64_t>(n) * h_stride * w_stride * c *
+      rknn_tensor_type_size(attr.type));
+  attr.pass_through = 0;
+  return attr;
+}
+
 inline void require_dense_native_copy_supported(const rknn_tensor_attr &attr,
                                                 const char *op_name) {
   const uint32_t dense = attr_dense_bytes(attr);
@@ -525,8 +620,13 @@ public:
     const size_t source_bytes = static_cast<size_t>(contiguous.nbytes());
     const size_t dense = attr_dense_bytes(attr_);
     const size_t alloc = attr_alloc_bytes(attr_);
-    if (should_transpose_nchw_to_nhwc(contiguous)) {
+    if (logical_shape_is_native_nhwc() &&
+        should_copy_nhwc_to_nhwc(contiguous)) {
+      copy_nhwc_to_nhwc(contiguous);
+    } else if (should_transpose_nchw_to_nhwc(contiguous)) {
       copy_nchw_to_nhwc(contiguous);
+    } else if (should_copy_nhwc_to_nhwc(contiguous)) {
+      copy_nhwc_to_nhwc(contiguous);
     } else if (source_bytes == alloc) {
       std::memcpy(dst_ptr, contiguous.data(), source_bytes);
     } else if (source_bytes == dense && dense == alloc) {
@@ -549,8 +649,12 @@ public:
     sync_from_device();
     py::dtype dtype = rknn_tensor_type_to_numpy_dtype(type_);
     py::array out(dtype, shape_);
-    std::memcpy(out.mutable_data(), src_ptr,
-                static_cast<size_t>(attr_dense_bytes(attr_)));
+    if (should_transpose_nhwc_to_nchw()) {
+      copy_nhwc_to_nchw(out);
+    } else {
+      std::memcpy(out.mutable_data(), src_ptr,
+                  static_cast<size_t>(attr_dense_bytes(attr_)));
+    }
     return out;
   }
 
@@ -591,13 +695,48 @@ private:
            c == static_cast<ssize_t>(attr_.dims[3]);
   }
 
+  bool should_copy_nhwc_to_nhwc(const py::array &source) const {
+    if (attr_.fmt != RKNN_TENSOR_NHWC || attr_.n_dims != 4 ||
+        source.ndim() != 4) {
+      return false;
+    }
+    return source.shape(0) == static_cast<ssize_t>(attr_.dims[0]) &&
+           source.shape(1) == static_cast<ssize_t>(attr_.dims[1]) &&
+           source.shape(2) == static_cast<ssize_t>(attr_.dims[2]) &&
+           source.shape(3) == static_cast<ssize_t>(attr_.dims[3]);
+  }
+
+  bool logical_shape_is_native_nhwc() const {
+    return attr_.fmt == RKNN_TENSOR_NHWC && attr_.n_dims == 4 &&
+           shape_.size() == 4 &&
+           shape_[0] == static_cast<int64_t>(attr_.dims[0]) &&
+           shape_[1] == static_cast<int64_t>(attr_.dims[1]) &&
+           shape_[2] == static_cast<int64_t>(attr_.dims[2]) &&
+           shape_[3] == static_cast<int64_t>(attr_.dims[3]);
+  }
+
+  bool should_transpose_nhwc_to_nchw() const {
+    if (attr_.fmt != RKNN_TENSOR_NHWC || attr_.n_dims != 4 ||
+        shape_.size() != 4) {
+      return false;
+    }
+    return shape_[0] == static_cast<int64_t>(attr_.dims[0]) &&
+           shape_[2] == static_cast<int64_t>(attr_.dims[1]) &&
+           shape_[3] == static_cast<int64_t>(attr_.dims[2]) &&
+           shape_[1] == static_cast<int64_t>(attr_.dims[3]);
+  }
+
   void copy_nchw_to_nhwc(const py::array &source) {
-    require_dense_native_copy_supported(attr_, "NCHW to NHWC update_inplace");
     const size_t elem_size = rknn_tensor_type_size(attr_.type);
     const size_t n = static_cast<size_t>(source.shape(0));
     const size_t c = static_cast<size_t>(source.shape(1));
     const size_t h = static_cast<size_t>(source.shape(2));
     const size_t w = static_cast<size_t>(source.shape(3));
+    const size_t h_stride = attr_height_stride(attr_);
+    const size_t w_stride = attr_width_stride(attr_);
+    if (h_stride < h || w_stride < w) {
+      throw std::runtime_error("NCHW to NHWC update_inplace has invalid RKNN stride");
+    }
     const auto *src = static_cast<const uint8_t *>(source.data());
     auto *dst = static_cast<uint8_t *>(mutable_data_ptr());
     for (size_t ni = 0; ni < n; ++ni) {
@@ -605,9 +744,67 @@ private:
         for (size_t wi = 0; wi < w; ++wi) {
           for (size_t ci = 0; ci < c; ++ci) {
             const size_t src_index = ((ni * c + ci) * h + hi) * w + wi;
-            const size_t dst_index = ((ni * h + hi) * w + wi) * c + ci;
+            const size_t dst_index =
+                ((ni * h_stride + hi) * w_stride + wi) * c + ci;
             std::memcpy(dst + dst_index * elem_size, src + src_index * elem_size,
                         elem_size);
+          }
+        }
+      }
+    }
+  }
+
+  void copy_nhwc_to_nhwc(const py::array &source) {
+    const size_t elem_size = rknn_tensor_type_size(attr_.type);
+    const size_t n = static_cast<size_t>(source.shape(0));
+    const size_t h = static_cast<size_t>(source.shape(1));
+    const size_t w = static_cast<size_t>(source.shape(2));
+    const size_t c = static_cast<size_t>(source.shape(3));
+    const size_t h_stride = attr_height_stride(attr_);
+    const size_t w_stride = attr_width_stride(attr_);
+    if (h_stride < h || w_stride < w) {
+      throw std::runtime_error("NHWC update_inplace has invalid RKNN stride");
+    }
+    const auto *src = static_cast<const uint8_t *>(source.data());
+    auto *dst = static_cast<uint8_t *>(mutable_data_ptr());
+    if (h_stride == h && w_stride == w) {
+      std::memcpy(dst, src, static_cast<size_t>(source.nbytes()));
+      return;
+    }
+    for (size_t ni = 0; ni < n; ++ni) {
+      for (size_t hi = 0; hi < h; ++hi) {
+        for (size_t wi = 0; wi < w; ++wi) {
+          const size_t src_index = ((ni * h + hi) * w + wi) * c;
+          const size_t dst_index = ((ni * h_stride + hi) * w_stride + wi) * c;
+          std::memcpy(dst + dst_index * elem_size,
+                      src + src_index * elem_size, c * elem_size);
+        }
+      }
+    }
+  }
+
+  void copy_nhwc_to_nchw(py::array &destination) {
+    const size_t elem_size = rknn_tensor_type_size(attr_.type);
+    const size_t n = static_cast<size_t>(shape_[0]);
+    const size_t c = static_cast<size_t>(shape_[1]);
+    const size_t h = static_cast<size_t>(shape_[2]);
+    const size_t w = static_cast<size_t>(shape_[3]);
+    const size_t h_stride = attr_height_stride(attr_);
+    const size_t w_stride = attr_width_stride(attr_);
+    if (h_stride < h || w_stride < w) {
+      throw std::runtime_error("NHWC to NCHW numpy has invalid RKNN stride");
+    }
+    const auto *src = static_cast<const uint8_t *>(mutable_data_ptr());
+    auto *dst = static_cast<uint8_t *>(destination.mutable_data());
+    for (size_t ni = 0; ni < n; ++ni) {
+      for (size_t ci = 0; ci < c; ++ci) {
+        for (size_t hi = 0; hi < h; ++hi) {
+          for (size_t wi = 0; wi < w; ++wi) {
+            const size_t src_index =
+                ((ni * h_stride + hi) * w_stride + wi) * c + ci;
+            const size_t dst_index = ((ni * c + ci) * h + hi) * w + wi;
+            std::memcpy(dst + dst_index * elem_size,
+                        src + src_index * elem_size, elem_size);
           }
         }
       }
@@ -682,8 +879,11 @@ private:
 
 class ZeroCopyEzRknn : public std::enable_shared_from_this<ZeroCopyEzRknn> {
 public:
-  explicit ZeroCopyEzRknn(std::shared_ptr<RknnContextHolder> holder)
-      : holder_(std::move(holder)), print_perf_(read_perf_env_enabled()) {
+  explicit ZeroCopyEzRknn(std::shared_ptr<RknnContextHolder> holder,
+                          ZeroCopyInputLayout input_layout =
+                              ZeroCopyInputLayout::NCHW)
+      : holder_(std::move(holder)), input_layout_(input_layout),
+        print_perf_(read_perf_env_enabled()) {
     init_from_context();
   }
 
@@ -840,18 +1040,36 @@ private:
     input_attrs_.resize(io_num_.n_input);
     native_input_attrs_.resize(io_num_.n_input);
     for (uint32_t i = 0; i < io_num_.n_input; ++i) {
-      input_attrs_[i].index = i;
-      ret = rknn_query(holder_->ctx, RKNN_QUERY_INPUT_ATTR, &input_attrs_[i],
+      rknn_tensor_attr queried_input_attr = {};
+      queried_input_attr.index = i;
+      ret = rknn_query(holder_->ctx, RKNN_QUERY_INPUT_ATTR, &queried_input_attr,
                        sizeof(rknn_tensor_attr));
       if (ret < 0) {
         throw std::runtime_error(format_rknn_error_for_index(
             "rknn_query(RKNN_QUERY_INPUT_ATTR)", "input attr", i, ret));
       }
+      input_attrs_[i] =
+          make_user_input_attr_for_layout(queried_input_attr, input_layout_);
+      input_attrs_[i].index = i;
       native_input_attrs_[i].index = i;
       ret = rknn_query(holder_->ctx, RKNN_QUERY_NATIVE_INPUT_ATTR,
                        &native_input_attrs_[i], sizeof(rknn_tensor_attr));
       if (ret < 0 || input_attrs_[i].n_dims != 4) {   //FIXME: zt: 5d tensor returned a completely wrong native shape, this looks like a vendor bug
         native_input_attrs_[i] = input_attrs_[i];
+      } else if (supports_native_nhwc_query_type(input_attrs_[i].type)) {
+        rknn_tensor_attr nhwc_attr = {};
+        nhwc_attr.index = i;
+        const int nhwc_ret =
+            rknn_query(holder_->ctx, RKNN_QUERY_NATIVE_NHWC_INPUT_ATTR,
+                       &nhwc_attr, sizeof(rknn_tensor_attr));
+        if (nhwc_ret >= 0 && nhwc_attr.n_dims == 4) {
+          native_input_attrs_[i] = nhwc_attr;
+        }
+        if (can_bind_nc1hwc2_input_as_nhwc(native_input_attrs_[i],
+                                           input_attrs_[i])) {
+          native_input_attrs_[i] = make_nhwc_input_attr_from_logical(
+              native_input_attrs_[i], input_attrs_[i]);
+        }
       }
     }
 
@@ -868,9 +1086,18 @@ private:
       native_output_attrs_[i].index = i;
       ret = rknn_query(holder_->ctx, RKNN_QUERY_NATIVE_OUTPUT_ATTR,
                        &native_output_attrs_[i], sizeof(rknn_tensor_attr));
-      // if (ret < 0 || output_attrs_[i].n_dims != 4) {
-      //   native_output_attrs_[i] = output_attrs_[i];
-      // }
+      if (ret < 0 || output_attrs_[i].n_dims != 4) {
+        native_output_attrs_[i] = output_attrs_[i];
+      } else if (supports_native_nhwc_query_type(output_attrs_[i].type)) {
+        rknn_tensor_attr nhwc_attr = {};
+        nhwc_attr.index = i;
+        const int nhwc_ret =
+            rknn_query(holder_->ctx, RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR,
+                       &nhwc_attr, sizeof(rknn_tensor_attr));
+        if (nhwc_ret >= 0 && nhwc_attr.n_dims == 4) {
+          native_output_attrs_[i] = nhwc_attr;
+        }
+      }
     }
 
     input_names_.reserve(input_attrs_.size());
@@ -893,6 +1120,7 @@ private:
   }
 
   std::shared_ptr<RknnContextHolder> holder_;
+  ZeroCopyInputLayout input_layout_ = ZeroCopyInputLayout::NCHW;
   rknn_input_output_num io_num_ = {};
   std::vector<rknn_tensor_attr> input_attrs_;
   std::vector<rknn_tensor_attr> output_attrs_;
