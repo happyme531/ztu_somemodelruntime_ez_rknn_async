@@ -35,6 +35,7 @@ namespace {
 constexpr int64_t kDefaultSubmitTimeoutMs = 10000;
 using ztu::rk::AsyncEzRknn;
 using ztu::rk::RknnIoBinding;
+using ztu::rk::RknnContextHolder;
 using ztu::rk::RknnOrtValue;
 using ztu::rk::ZeroCopyEzRknn;
 using ztu::rk::rknn_tensor_type_to_numpy_dtype;
@@ -641,12 +642,12 @@ public:
     // Avoid deadlock: Async worker/callback threads may need the GIL while
     // shutting down callbacks that hold Python objects.
     py::gil_scoped_release release;
+    zero_copy_.reset();
     rknn_.reset();
   }
 
   InferenceSession(const std::string &model_path, const SessionConfig &config)
-      : model_path_(model_path), pipeline_depth_(0), pipeline_initialized_(false),
-        nchw_software_(false),
+      : pipeline_depth_(0), pipeline_initialized_(false), nchw_software_(false),
         submit_timeout_(std::chrono::milliseconds(config.submit_timeout_ms)) {
     const bool has_custom_op_request =
         !config.custom_op_paths.empty() || config.custom_op_default_path;
@@ -678,7 +679,7 @@ public:
       throw std::runtime_error("Unknown layout: " + config.layout);
     }
 
-    rknn_ = std::make_unique<AsyncEzRknn>(
+    rknn_ = std::make_shared<AsyncEzRknn>(
         model_path, layout_enum, config.max_queue_size, config.threads_per_core,
         config.sequential_callbacks, config.schedule, config.tp_core_mask,
         config.enable_pacing, disable_dup_context);
@@ -694,6 +695,12 @@ public:
     if (has_custom_op_request) {
       rknn_->register_loaded_custom_ops();
     }
+    if (rknn_->contexts.empty() || rknn_->contexts[0] == 0) {
+      throw std::runtime_error("Async RKNN context is not available");
+    }
+    auto zero_copy_holder = std::make_shared<RknnContextHolder>(
+        rknn_->contexts[0], false, std::static_pointer_cast<void>(rknn_));
+    zero_copy_ = std::make_shared<ZeroCopyEzRknn>(std::move(zero_copy_holder));
 
     input_attrs_ = rknn_->input_attrs;
     output_attrs_ = rknn_->output_attrs;
@@ -881,9 +888,8 @@ public:
   }
 
   std::shared_ptr<ZeroCopyEzRknn> zero_copy_backend() {
-    std::lock_guard<std::mutex> lock(zero_copy_mutex_);
     if (!zero_copy_) {
-      zero_copy_ = std::make_shared<ZeroCopyEzRknn>(model_path_);
+      throw std::runtime_error("Zero-copy RKNN backend is not available");
     }
     return zero_copy_;
   }
@@ -1209,10 +1215,8 @@ private:
     return infos;
   }
 
-  std::unique_ptr<AsyncEzRknn> rknn_;
-  std::string model_path_;
+  std::shared_ptr<AsyncEzRknn> rknn_;
   std::shared_ptr<ZeroCopyEzRknn> zero_copy_;
-  std::mutex zero_copy_mutex_;
   std::vector<rknn_tensor_attr> input_attrs_;
   std::vector<rknn_tensor_attr> output_attrs_;
   std::vector<std::string> input_names_;

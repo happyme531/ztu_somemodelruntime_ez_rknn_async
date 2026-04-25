@@ -10,8 +10,6 @@
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <fcntl.h>
 #include <iostream>
 #include <linux/dma-heap.h>
@@ -131,17 +129,21 @@ inline void require_dense_native_copy_supported(const rknn_tensor_attr &attr,
 }
 
 struct RknnContextHolder {
-  explicit RknnContextHolder(rknn_context context) : ctx(context) {}
+  explicit RknnContextHolder(rknn_context context, bool owns_context = true,
+                             std::shared_ptr<void> owner = nullptr)
+      : ctx(context), owns_context(owns_context), owner(std::move(owner)) {}
   RknnContextHolder(const RknnContextHolder &) = delete;
   RknnContextHolder &operator=(const RknnContextHolder &) = delete;
   ~RknnContextHolder() {
-    if (ctx != 0) {
+    if (owns_context && ctx != 0) {
       rknn_destroy(ctx);
       ctx = 0;
     }
   }
 
   rknn_context ctx = 0;
+  bool owns_context = true;
+  std::shared_ptr<void> owner;
 };
 
 class SharedDmaBuffer {
@@ -662,9 +664,9 @@ private:
 
 class ZeroCopyEzRknn : public std::enable_shared_from_this<ZeroCopyEzRknn> {
 public:
-  explicit ZeroCopyEzRknn(const std::filesystem::path &model_path)
-      : model_path_(model_path), print_perf_(read_perf_env_enabled()) {
-    init();
+  explicit ZeroCopyEzRknn(std::shared_ptr<RknnContextHolder> holder)
+      : holder_(std::move(holder)), print_perf_(read_perf_env_enabled()) {
+    init_from_context();
   }
 
   std::shared_ptr<RknnContextHolder> holder() const { return holder_; }
@@ -805,28 +807,13 @@ private:
     return it->second;
   }
 
-  void init() {
-    std::ifstream file(model_path_, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-      throw std::runtime_error("Failed to open model file: " +
-                               model_path_.string());
-    }
-    const size_t model_size = static_cast<size_t>(file.tellg());
-    file.seekg(0, std::ios::beg);
-    model_data_.resize(model_size);
-    if (!file.read(reinterpret_cast<char *>(model_data_.data()), model_size)) {
-      throw std::runtime_error("Failed to read model file");
+  void init_from_context() {
+    if (!holder_ || holder_->ctx == 0) {
+      throw std::runtime_error("RKNN context is not available");
     }
 
-    rknn_context ctx = 0;
-    int ret = rknn_init(&ctx, model_data_.data(), model_size, 0, nullptr);
-    if (ret < 0) {
-      throw std::runtime_error(format_rknn_error("rknn_init", ret));
-    }
-    holder_ = std::make_shared<RknnContextHolder>(ctx);
-
-    ret = rknn_query(holder_->ctx, RKNN_QUERY_IN_OUT_NUM, &io_num_,
-                     sizeof(io_num_));
+    int ret = rknn_query(holder_->ctx, RKNN_QUERY_IN_OUT_NUM, &io_num_,
+                         sizeof(io_num_));
     if (ret < 0) {
       throw std::runtime_error(
           format_rknn_error("rknn_query(RKNN_QUERY_IN_OUT_NUM)", ret));
@@ -887,8 +874,6 @@ private:
     }
   }
 
-  std::filesystem::path model_path_;
-  std::vector<uint8_t> model_data_;
   std::shared_ptr<RknnContextHolder> holder_;
   rknn_input_output_num io_num_ = {};
   std::vector<rknn_tensor_attr> input_attrs_;
