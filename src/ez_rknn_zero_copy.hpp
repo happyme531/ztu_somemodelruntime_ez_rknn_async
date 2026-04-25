@@ -228,6 +228,11 @@ inline uint32_t attr_height_stride_value(const rknn_tensor_attr &attr) {
   return 0;
 }
 
+inline bool attr_uses_spatial_stride(const rknn_tensor_attr &attr) {
+  return attr.n_dims == 4 &&
+         (attr.fmt == RKNN_TENSOR_NCHW || attr.fmt == RKNN_TENSOR_NHWC);
+}
+
 inline std::string native_attr_mismatch_reason(const rknn_tensor_attr &actual,
                                                const rknn_tensor_attr &expected) {
   std::vector<std::string> items;
@@ -245,12 +250,12 @@ inline std::string native_attr_mismatch_reason(const rknn_tensor_attr &actual,
   append_attr_mismatch(items, "size", actual.size, expected.size);
   append_attr_mismatch(items, "size_with_stride", actual.size_with_stride,
                        expected.size_with_stride);
-  append_attr_mismatch(items, "w_stride", attr_width_stride_value(actual),
-                       attr_width_stride_value(expected));
-  append_attr_mismatch(items, "h_stride", attr_height_stride_value(actual),
-                       attr_height_stride_value(expected));
-  append_attr_mismatch(items, "pass_through", actual.pass_through,
-                       expected.pass_through);
+  if (attr_uses_spatial_stride(actual) || attr_uses_spatial_stride(expected)) {
+    append_attr_mismatch(items, "w_stride", attr_width_stride_value(actual),
+                         attr_width_stride_value(expected));
+    append_attr_mismatch(items, "h_stride", attr_height_stride_value(actual),
+                         attr_height_stride_value(expected));
+  }
   append_attr_mismatch(items, "qnt_type", static_cast<uint64_t>(actual.qnt_type),
                        static_cast<uint64_t>(expected.qnt_type));
   append_attr_mismatch_signed(items, "fl", static_cast<int64_t>(actual.fl),
@@ -338,6 +343,7 @@ inline bool supports_native_nhwc_query_type(rknn_tensor_type type) {
 }
 
 enum class ZeroCopyInputLayout { NCHW, NHWC, ANY };
+enum class ZeroCopyLayoutMode { NHWC, NATIVE };
 
 inline rknn_tensor_attr
 make_user_input_attr_for_layout(const rknn_tensor_attr &attr,
@@ -347,9 +353,11 @@ make_user_input_attr_for_layout(const rknn_tensor_attr &attr,
   }
   rknn_tensor_attr logical = attr;
   const uint32_t n = attr.dims[0];
+  // 如果指定numpy输入是NHWC，暴露NHWC的shape（让NPU帮你转置）
   if (layout == ZeroCopyInputLayout::NHWC) {
     return logical;
   }
+  // 否则转回NCHW
   if (attr.fmt == RKNN_TENSOR_NHWC) {
     logical.dims[0] = n;
     logical.dims[1] = attr.dims[3];
@@ -1105,8 +1113,11 @@ class ZeroCopyEzRknn : public std::enable_shared_from_this<ZeroCopyEzRknn> {
 public:
   explicit ZeroCopyEzRknn(std::shared_ptr<RknnContextHolder> holder,
                           ZeroCopyInputLayout input_layout =
-                              ZeroCopyInputLayout::NCHW)
+                              ZeroCopyInputLayout::NCHW,
+                          ZeroCopyLayoutMode layout_mode =
+                              ZeroCopyLayoutMode::NHWC)
       : holder_(std::move(holder)), input_layout_(input_layout),
+        layout_mode_(layout_mode),
         print_perf_(read_perf_env_enabled()) {
     init_from_context();
   }
@@ -1284,22 +1295,43 @@ private:
       native_input_attrs_[i].index = i;
       ret = rknn_query(holder_->ctx, RKNN_QUERY_NATIVE_INPUT_ATTR,
                        &native_input_attrs_[i], sizeof(rknn_tensor_attr));
-      if (ret < 0 || input_attrs_[i].n_dims != 4) {   //FIXME: zt: 5d tensor returned a completely wrong native shape, this looks like a vendor bug
-        native_input_attrs_[i] = input_attrs_[i];
-      } else if (supports_native_nhwc_query_type(input_attrs_[i].type)) {
+      // 4. When the layout is RKNN_TENSOR_UNDEFINED, the input is generally not 4-dimensional. When
+      // transfering data to the NPU, it needs to be passed to the NPU according to the input format of ONNX
+      // model. NPU does not perform any mean/std processing and layout conversion.
+      if (ret < 0 || input_attrs_[i].n_dims != 4) {  
+        native_input_attrs_[i] = input_attrs_[i];  //FIXME: zt: 5d tensor returned a completely wrong native shape, this looks like a vendor bug
+      } else if (layout_mode_ == ZeroCopyLayoutMode::NHWC &&
+                 supports_native_nhwc_query_type(input_attrs_[i].type)) {
         rknn_tensor_attr nhwc_attr = {};
         nhwc_attr.index = i;
+        // 1. When the layout is RKNN_TENSOR_NCHW, the input is generally 4 dimensional and the data type
+        //is bool or int64. When transfering data to the NPU, it also needs to be arranged in the NCHW format.
+        // 2. When the layout is RKNN_TENSOR_NHWC, the input is generally 4 dimensional and the data type
+        // is one of the float32/float16/int8/uint8. And the number of input channels is 1, 3 or 4. When
+        // transfering data to the NPU, it also needs to be arranged in the NHWC format and sent to the NPU. It
+        // should be noted that when pass_through=1, the width may need to be aligned with stride, depending
+        // on the value of w_stride queried.
         const int nhwc_ret =
             rknn_query(holder_->ctx, RKNN_QUERY_NATIVE_NHWC_INPUT_ATTR,
                        &nhwc_attr, sizeof(rknn_tensor_attr));
         if (nhwc_ret >= 0 && nhwc_attr.n_dims == 4) {
           native_input_attrs_[i] = nhwc_attr;
         }
+        // 3. When the layout is RKNN_TENSOR_NC1HWC2, the input is generally 4-dimensional and the data
+        // type is float16/int8. And the number of input channels is not 1, 3, or 4. When pass_through=0, the
+        // input data is arranged in the NHWC format, and the interface will perform CPU conversion from
+        // NHWC to NC1HWC2; 
         if (can_bind_nc1hwc2_input_as_nhwc(native_input_attrs_[i],
                                            input_attrs_[i])) {
           native_input_attrs_[i] = make_nhwc_input_attr_from_logical(
               native_input_attrs_[i], input_attrs_[i]);
         }
+      }
+      // ... when pass_through=1, the input data is arranged in the NC1HWC2 format,
+      // and the user needs to convert it externally.
+      if (layout_mode_ == ZeroCopyLayoutMode::NATIVE &&
+          native_input_attrs_[i].fmt == RKNN_TENSOR_NC1HWC2) {
+        native_input_attrs_[i].pass_through = 1;
       }
     }
 
@@ -1316,11 +1348,17 @@ private:
       native_output_attrs_[i].index = i;
       ret = rknn_query(holder_->ctx, RKNN_QUERY_NATIVE_OUTPUT_ATTR,
                        &native_output_attrs_[i], sizeof(rknn_tensor_attr));
+      // 2. When layout is RKNN_TENSOR_UNDEFINED, the output is generally not 4-dimensional, and the
+      // data type is float16/int8. The user no need to perform layout conversion externally.
       if (ret < 0 || output_attrs_[i].n_dims != 4) {
         native_output_attrs_[i] = output_attrs_[i];
-      } else if (supports_native_nhwc_query_type(output_attrs_[i].type)) {
+      } else if (layout_mode_ == ZeroCopyLayoutMode::NHWC &&
+                 supports_native_nhwc_query_type(output_attrs_[i].type)) {
         rknn_tensor_attr nhwc_attr = {};
         nhwc_attr.index = i;
+        // When the output is 4-dimensional and the user needs NHWC layout output, can use
+        // RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR to query related attributes. This way can directly
+        // query native output nhwc layout from NPU.
         const int nhwc_ret =
             rknn_query(holder_->ctx, RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR,
                        &nhwc_attr, sizeof(rknn_tensor_attr));
@@ -1351,6 +1389,7 @@ private:
 
   std::shared_ptr<RknnContextHolder> holder_;
   ZeroCopyInputLayout input_layout_ = ZeroCopyInputLayout::NCHW;
+  ZeroCopyLayoutMode layout_mode_ = ZeroCopyLayoutMode::NHWC;
   rknn_input_output_num io_num_ = {};
   std::vector<rknn_tensor_attr> input_attrs_;
   std::vector<rknn_tensor_attr> output_attrs_;

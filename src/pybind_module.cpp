@@ -39,6 +39,7 @@ using ztu::rk::RknnContextHolder;
 using ztu::rk::RknnOrtValue;
 using ztu::rk::ZeroCopyEzRknn;
 using ztu::rk::ZeroCopyInputLayout;
+using ztu::rk::ZeroCopyLayoutMode;
 using ztu::rk::attr_shape_i64;
 using ztu::rk::require_shape_matches;
 using ztu::rk::shape_to_string;
@@ -71,6 +72,7 @@ struct ModelMetadataInfo {
 
 struct SessionConfig {
   std::string layout = "nchw";
+  std::string zero_copy_layout = "nhwc";
   size_t max_queue_size = 3;
   int threads_per_core = 1;
   int64_t submit_timeout_ms = kDefaultSubmitTimeoutMs;
@@ -418,6 +420,10 @@ SessionConfig parse_session_config(const py::object &provider_options_obj) {
       config.layout = py::cast<std::string>(item.second);
       continue;
     }
+    if (key == "zero_copy_layout") {
+      config.zero_copy_layout = py::cast<std::string>(item.second);
+      continue;
+    }
     if (key == "max_queue_size") {
       int64_t value = parse_int_like(item.second, "max_queue_size");
       if (value <= 0) {
@@ -477,7 +483,7 @@ SessionConfig parse_session_config(const py::object &provider_options_obj) {
     }
     throw std::runtime_error(
         "Unknown provider_options key: " + key +
-        ". Supported keys: layout, max_queue_size, threads_per_core, "
+        ". Supported keys: layout, zero_copy_layout, max_queue_size, threads_per_core, "
         "submit_timeout_ms, "
         "sequential_callbacks, schedule, tp_mode, enable_pacing, "
         "disable_dup_context, custom_op_path, custom_op_paths, "
@@ -735,10 +741,25 @@ public:
     } else if (layout_lower == "any") {
       zero_copy_input_layout = ZeroCopyInputLayout::ANY;
     }
+    ZeroCopyLayoutMode zero_copy_layout_mode = ZeroCopyLayoutMode::NHWC;
+    std::string zero_copy_layout_lower = config.zero_copy_layout;
+    for (auto &c : zero_copy_layout_lower) {
+      c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    }
+    if (zero_copy_layout_lower == "nhwc") {
+      zero_copy_layout_mode = ZeroCopyLayoutMode::NHWC;
+    } else if (zero_copy_layout_lower == "native") {
+      zero_copy_layout_mode = ZeroCopyLayoutMode::NATIVE;
+    } else {
+      throw std::runtime_error(
+          "Unknown zero_copy_layout: " + config.zero_copy_layout +
+          ", expected 'nhwc' or 'native'");
+    }
     auto zero_copy_holder = std::make_shared<RknnContextHolder>(
         rknn_->contexts[0], false, std::static_pointer_cast<void>(rknn_));
     zero_copy_ = std::make_shared<ZeroCopyEzRknn>(std::move(zero_copy_holder),
-                                                  zero_copy_input_layout);
+                                                  zero_copy_input_layout,
+                                                  zero_copy_layout_mode);
 
     input_attrs_ = rknn_->input_attrs;
     output_attrs_ = rknn_->output_attrs;
