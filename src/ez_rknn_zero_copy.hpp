@@ -12,7 +12,25 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <iostream>
+#if defined(__has_include)
+#if __has_include(<linux/dma-heap.h>)
 #include <linux/dma-heap.h>
+#define ZTU_HAVE_LINUX_DMA_HEAP_H 1
+#endif
+#endif
+#ifndef ZTU_HAVE_LINUX_DMA_HEAP_H
+#include <linux/ioctl.h>
+#include <linux/types.h>
+struct dma_heap_allocation_data {
+  __u64 len;
+  __u32 fd;
+  __u32 fd_flags;
+  __u64 heap_flags;
+};
+#define DMA_HEAP_IOC_MAGIC 'H'
+#define DMA_HEAP_IOCTL_ALLOC                                                   \
+  _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
+#endif
 #include <map>
 #include <memory>
 #include <numeric>
@@ -104,7 +122,7 @@ inline uint32_t attr_dense_bytes(const rknn_tensor_attr &attr) {
 
 inline uint32_t attr_alloc_bytes(const rknn_tensor_attr &attr) {
   if (attr.n_dims != 4 || attr.fmt == RKNN_TENSOR_UNDEFINED) {
-    return attr_dense_bytes(attr);
+    return attr_dense_bytes(attr); //FIXME: zt: rknpu2 api returned wrong size for non-4d tensor?
   }
   if (attr.size_with_stride > 0) {
     return attr.size_with_stride;
@@ -1045,7 +1063,7 @@ inline void ZeroCopyEzRknn::run_with_iobinding(RknnIoBinding &binding) {
       }
       rknn_tensor_attr attr = native_input_attrs_[i];
       attr.index = static_cast<uint32_t>(i);
-      const int ret = rknn_set_io_mem(holder_->ctx, mem, &attr);
+      const int ret = rknn_set_io_mem(holder_->ctx, mem, &attr);  //TODO: zt: do we need to call this every time?
       if (ret < 0) {
         throw std::runtime_error(format_rknn_error_for_index(
             "rknn_set_io_mem", "input", static_cast<uint32_t>(i), ret));
