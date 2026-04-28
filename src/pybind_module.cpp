@@ -963,8 +963,7 @@ private:
                                  std::to_string(expected_inputs) +
                                  " inputs, but a single array was given");
       }
-      py::array arr = ensure_array(input_feed, 0);
-      return {parse_array(arr, input_attrs_[0], allow_batch, input_names_[0])};
+      return {parse_input_array(input_feed, 0, allow_batch)};
     }
 
     if (py::isinstance<py::dict>(input_feed)) {
@@ -981,9 +980,7 @@ private:
         if (!d.contains(key)) {
           throw std::runtime_error("Missing input: " + input_names_[i]);
         }
-        py::array arr = ensure_array(d[key], i);
-        inputs.push_back(
-            parse_array(arr, input_attrs_[i], allow_batch, input_names_[i]));
+        inputs.push_back(parse_input_array(d[key], i, allow_batch));
       }
       return inputs;
     }
@@ -999,9 +996,7 @@ private:
       std::vector<ParsedInput> inputs;
       inputs.reserve(expected_inputs);
       for (size_t i = 0; i < expected_inputs; ++i) {
-        py::array arr = ensure_array(seq[i], i);
-        inputs.push_back(
-            parse_array(arr, input_attrs_[i], allow_batch, input_names_[i]));
+        inputs.push_back(parse_input_array(seq[i], i, allow_batch));
       }
       return inputs;
     }
@@ -1011,14 +1006,26 @@ private:
   }
 
   py::array ensure_array(py::handle obj, size_t input_index) {
+    (void)input_index;
     py::array array = py::array::ensure(obj, py::array::c_style);
     if (!array) {
       throw std::runtime_error("Input must be a numpy array");
     }
-    if (nchw_software_ && input_attrs_[input_index].n_dims == 4) {
-      return transpose_nchw_to_nhwc(array);
-    }
     return array;
+  }
+
+  ParsedInput parse_input_array(py::handle obj, size_t input_index,
+                                bool allow_batch) {
+    py::array user_array = ensure_array(obj, input_index);
+    ParsedInput parsed = parse_array(user_array, input_attrs_[input_index],
+                                     allow_batch, input_names_[input_index]);
+    if (!nchw_software_ || input_attrs_[input_index].n_dims != 4) {
+      return parsed;
+    }
+
+    py::array native_array = transpose_nchw_to_nhwc(user_array);
+    return parse_array(native_array, rknn_->input_attrs[input_index],
+                       allow_batch, input_names_[input_index]);
   }
 
   py::array transpose_nchw_to_nhwc(const py::array &array) {

@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "ztu_somemodelruntime_ez_rknn_async"
-version = "0.8.3"
+version = "0.8.4"
 description = "RKNN async inference Python bindings"
 readme = "README.md"
 license = { file = "LICENSE" }
