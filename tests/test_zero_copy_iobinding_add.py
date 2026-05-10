@@ -59,7 +59,7 @@ def _shape_for(rank, dtype, channel):
 
 def _load_quick_convert():
     project_root = Path(__file__).resolve().parents[1]
-    quickconvert_path = project_root.parent / "rknn_quickconvert.py"
+    quickconvert_path = project_root / "rknn_quickconvert.py"
     spec = importlib.util.spec_from_file_location("rknn_quickconvert", quickconvert_path)
     if spec is None or spec.loader is None:
         pytest.skip(f"cannot load {quickconvert_path}")

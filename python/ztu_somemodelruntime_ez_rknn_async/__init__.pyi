@@ -120,6 +120,8 @@ class InferenceSession:
         provider_options: Optional[
             Union[Sequence[RknnProviderOptions], RknnProviderOptions]
         ] = ...,
+        *,
+        use_weight_from: Optional["InferenceSession"] = ...,
         **kwargs: Any,
     ) -> None: ...
 

@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "ztu_somemodelruntime_ez_rknn_async"
-version = "0.8.4"
+version = "0.9.0"
 description = "RKNN async inference Python bindings"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -45,7 +45,7 @@ classifiers = [
 
 [tool.scikit-build]
 wheel.packages = ["python/ztu_somemodelruntime_ez_rknn_async"]
-sdist.include = ["src/**", "python/**", "CMakeLists.txt"]
+sdist.include = ["src/**", "python/**", "CMakeLists.txt", "rknn_quickconvert.py"]
 sdist.exclude = ["dist/**", "wheelhouse/**", "*.whl", "*.tar.gz"]
 
 [tool.scikit-build.cmake]

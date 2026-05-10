@@ -683,13 +683,23 @@ public:
     rknn_.reset();
   }
 
-  InferenceSession(const std::string &model_path, const SessionConfig &config)
-      : pipeline_depth_(0), pipeline_initialized_(false), nchw_software_(false),
+  InferenceSession(const std::string &model_path, const SessionConfig &config,
+                   const InferenceSession *use_weight_from = nullptr,
+                   py::object use_weight_from_obj = py::none())
+      : use_weight_from_(std::move(use_weight_from_obj)),
+        pipeline_depth_(0), pipeline_initialized_(false),
+        nchw_software_(false),
         submit_timeout_(std::chrono::milliseconds(config.submit_timeout_ms)) {
     const bool has_custom_op_request =
         !config.custom_op_paths.empty() || config.custom_op_default_path;
+    if (use_weight_from != nullptr && has_custom_op_request) {
+      throw std::runtime_error(
+          "use_weight_from cannot be combined with custom-op loading");
+    }
+
     const bool disable_dup_context =
-        config.disable_dup_context || has_custom_op_request;
+        config.disable_dup_context || has_custom_op_request ||
+        use_weight_from != nullptr;
 
     if (has_custom_op_request) {
       emit_python_user_warning(
@@ -716,10 +726,21 @@ public:
       throw std::runtime_error("Unknown layout: " + config.layout);
     }
 
+    std::optional<rknn_context> shared_weight_master_ctx = std::nullopt;
+    if (use_weight_from != nullptr) {
+      if (use_weight_from->rknn_ == nullptr ||
+          use_weight_from->rknn_->contexts.empty() ||
+          use_weight_from->rknn_->contexts[0] == 0) {
+        throw std::runtime_error(
+            "use_weight_from must reference an initialized master session");
+      }
+      shared_weight_master_ctx = use_weight_from->rknn_->contexts[0];
+    }
+
     rknn_ = std::make_shared<AsyncEzRknn>(
         model_path, layout_enum, config.max_queue_size, config.threads_per_core,
         config.sequential_callbacks, config.schedule, config.tp_core_mask,
-        config.enable_pacing, disable_dup_context);
+        config.enable_pacing, disable_dup_context, shared_weight_master_ctx);
     if (rknn_->sdk_version_warning().has_value()) {
       emit_python_user_warning(rknn_->sdk_version_warning().value());
     }
@@ -1283,6 +1304,7 @@ private:
     return infos;
   }
 
+  py::object use_weight_from_;
   std::shared_ptr<AsyncEzRknn> rknn_;
   std::shared_ptr<ZeroCopyEzRknn> zero_copy_;
   std::vector<rknn_tensor_attr> input_attrs_;
@@ -1529,17 +1551,33 @@ PYBIND11_MODULE(_core, m) {
                        py::kwargs kwargs) {
              (void)sess_options;
              (void)providers;
-             (void)kwargs;
+             py::object use_weight_from_obj = py::none();
+             const InferenceSession *use_weight_from = nullptr;
+             if (kwargs.contains("use_weight_from")) {
+               use_weight_from_obj = kwargs["use_weight_from"];
+               if (!use_weight_from_obj.is_none()) {
+                 try {
+                   use_weight_from =
+                       use_weight_from_obj.cast<InferenceSession *>();
+                 } catch (const py::cast_error &) {
+                   throw std::runtime_error(
+                       "use_weight_from must be an InferenceSession or None");
+                 }
+               }
+             }
              SessionConfig config = parse_session_config(provider_options);
              return std::make_unique<InferenceSession>(
-                 resolve_model_path(path_or_bytes), config);
+                 resolve_model_path(path_or_bytes), config, use_weight_from,
+                 std::move(use_weight_from_obj));
            }),
            py::arg("path_or_bytes"), py::arg("sess_options") = py::none(),
            py::arg("providers") = py::none(),
            py::arg("provider_options") = py::none(),
            "Create an inference session.\n\n"
            "ORT-style constructor. provider_options carries RKNN runtime "
-           "options, including custom op loading settings.")
+           "options, including custom op loading settings.\n"
+           "use_weight_from can be set to another initialized session whose "
+           "weight memory should be reused.")
       .def("run", &InferenceSession::run, py::arg("output_names") = py::none(),
            py::arg("input_feed"), py::arg("run_options") = py::none(),
            "Run inference.\n\n"

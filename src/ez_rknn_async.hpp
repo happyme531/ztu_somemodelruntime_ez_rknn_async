@@ -126,14 +126,18 @@ public:
               int threadsPerCore = 2, bool sequentialCallbacks = true,
               std::optional<std::vector<uint64_t>> schedule = std::nullopt,
               std::optional<rknn_core_mask> tpCoreMask = RKNN_NPU_CORE_AUTO,
-              bool enablePacing = false, bool disableDupContext = false)
+              bool enablePacing = false, bool disableDupContext = false,
+              std::optional<rknn_context> sharedWeightMasterContext =
+                  std::nullopt)
       : model_path_(model_path), layout_(layout), maxQueueSize_(maxQueueSize),
         threadsPerCore_(threadsPerCore), stopFlag(false), taskCounter(0),
         sequentialCallbacks_(sequentialCallbacks), nextSequentialTask(0),
         schedule_(schedule.value_or(std::vector<uint64_t>{0})),
         useScheduleMask_(schedule.has_value()),
         tpCoreMask_(tpCoreMask.value_or(RKNN_NPU_CORE_AUTO)),
-        disableDupContext_(disableDupContext), enablePacing_(enablePacing),
+        disableDupContext_(disableDupContext),
+        sharedWeightMasterContext_(sharedWeightMasterContext),
+        enablePacing_(enablePacing),
         printPerf_(read_perf_env_enabled()) {
     // 使用 Tracy 标记构造函数
 #ifdef TRACY_ENABLE
@@ -688,6 +692,7 @@ private:
   bool useScheduleMask_ = true;
   rknn_core_mask tpCoreMask_ = RKNN_NPU_CORE_AUTO;
   bool disableDupContext_ = false;
+  std::optional<rknn_context> sharedWeightMasterContext_;
   bool isDynamicShapeModel_ = false;
 
   // RKNN 相关变量
@@ -904,8 +909,18 @@ private:
     if (!file.read(reinterpret_cast<char *>(model_data.data()), model_size)) {
       throw std::runtime_error("Failed to read model file");
     }
-    int ret =
-        rknn_init(&initial_ctx, model_data.data(), model_size, 0, nullptr);
+    const bool use_shared_weight = sharedWeightMasterContext_.has_value();
+    rknn_init_extend init_extend;
+    std::memset(&init_extend, 0, sizeof(init_extend));
+    uint32_t init_flags = 0;
+    rknn_init_extend *init_extend_ptr = nullptr;
+    if (use_shared_weight) {
+      init_extend.ctx = sharedWeightMasterContext_.value();
+      init_flags = RKNN_FLAG_SHARE_WEIGHT_MEM;
+      init_extend_ptr = &init_extend;
+    }
+    int ret = rknn_init(&initial_ctx, model_data.data(), model_size,
+                        init_flags, init_extend_ptr);
     if (ret < 0) {
       throw std::runtime_error(format_rknn_error("rknn_init", ret));
     }
@@ -979,12 +994,22 @@ private:
 #if ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT
       disable_dup_context = true;
 #else
-      disable_dup_context = disableDupContext_;
+      disable_dup_context =
+          disableDupContext_ || sharedWeightMasterContext_.has_value();
 #endif
       if (disable_dup_context) {
         // 禁用 dup_context，使用 init 初始化每个 context
-        int ret =
-            rknn_init(&contexts[i], model_data.data(), model_size, 0, nullptr);
+        rknn_init_extend init_extend;
+        std::memset(&init_extend, 0, sizeof(init_extend));
+        uint32_t init_flags = 0;
+        rknn_init_extend *init_extend_ptr = nullptr;
+        if (sharedWeightMasterContext_.has_value()) {
+          init_extend.ctx = sharedWeightMasterContext_.value();
+          init_flags = RKNN_FLAG_SHARE_WEIGHT_MEM;
+          init_extend_ptr = &init_extend;
+        }
+        int ret = rknn_init(&contexts[i], model_data.data(), model_size,
+                            init_flags, init_extend_ptr);
         if (ret < 0) {
           throw std::runtime_error(format_rknn_error("rknn_init", ret));
         }
