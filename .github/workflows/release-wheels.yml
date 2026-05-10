@@ -26,13 +26,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install cibuildwheel
-        run: python -m pip install --upgrade pip "cibuildwheel<3" build
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build
 
       - name: Build Source Distribution
         run: python -m build --sdist --outdir dist
 
-      - name: Build Wheels
+      - name: Build Wheels (Python 3.7-3.13)
         env:
           CIBW_ARCHS_LINUX: aarch64
           CIBW_BUILD: cp37-* cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*
@@ -43,7 +43,24 @@ jobs:
             curl -fL https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so -o /usr/local/lib/librknnrt.so &&
             chmod 755 /usr/local/lib/librknnrt.so &&
             ldconfig
-        run: python -m cibuildwheel --output-dir wheelhouse
+        run: |
+          python -m pip install --upgrade "cibuildwheel<3"
+          python -m cibuildwheel --output-dir wheelhouse
+
+      - name: Build Wheels (Python 3.14)
+        env:
+          CIBW_ARCHS_LINUX: aarch64
+          CIBW_BUILD: cp314-*
+          CIBW_SKIP: "*-musllinux_*"
+          CIBW_CONFIG_SETTINGS: "cmake.build-type=Release"
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --exclude librknnrt.so"
+          CIBW_BEFORE_ALL_LINUX: >-
+            curl -fL https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so -o /usr/local/lib/librknnrt.so &&
+            chmod 755 /usr/local/lib/librknnrt.so &&
+            ldconfig
+        run: |
+          python -m pip install --upgrade "cibuildwheel>=3,<4"
+          python -m cibuildwheel --output-dir wheelhouse
 
       - name: Collect Artifacts
         run: |

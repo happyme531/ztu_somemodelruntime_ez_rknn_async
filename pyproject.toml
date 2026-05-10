@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "ztu_somemodelruntime_ez_rknn_async"
-version = "0.9.0"
+version = "0.9.1"
 description = "RKNN async inference Python bindings"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -34,6 +34,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Programming Language :: C++",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
