@@ -57,6 +57,7 @@ build-type = "Release"
 [tool.scikit-build.cmake.define]
 ZTU_SOMEMODELRUNTIME_RKNN_BUILD_PYTHON = "ON"
 ZTU_SOMEMODELRUNTIME_RKNN_INSTALL_DEVEL = "OFF"
+BUILD_TESTING = "OFF"
 
 [tool.scikit-build.install]
 strip = false

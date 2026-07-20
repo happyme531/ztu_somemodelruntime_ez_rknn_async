@@ -37,7 +37,7 @@ jobs:
           PACKAGE_VERSION: ${{ github.ref_name }}
         run: |
           PACKAGE_VERSION="${PACKAGE_VERSION#v}"
-          PACKAGE_NAME="ztu_rknn-${PACKAGE_VERSION}-linux-aarch64"
+          PACKAGE_NAME="ztu_somemodelruntime_rknn-${PACKAGE_VERSION}-linux-aarch64"
           mkdir -p release-assets
           docker run --rm --platform linux/arm64 \
             -e PACKAGE_NAME="${PACKAGE_NAME}" \
@@ -52,16 +52,16 @@ jobs:
                 https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so \
                 -o /usr/local/lib/librknnrt.so
               ldconfig
-              cmake -S . -B build/native-release \
+              cmake -S . -B /tmp/ztu-native-release \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_LIBDIR=lib \
                 -DBUILD_TESTING=OFF \
-                -DZTU_RKNN_BUILD_PYTHON=OFF \
-                -DZTU_RKNN_INSTALL_DEVEL=ON
-              cmake --build build/native-release --parallel
-              cmake --install build/native-release \
-                --prefix "/project/build/${PACKAGE_NAME}"
-              tar -C /project/build -czf "/project/release-assets/${PACKAGE_NAME}.tar.gz" \
+                -DZTU_SOMEMODELRUNTIME_RKNN_BUILD_PYTHON=OFF \
+                -DZTU_SOMEMODELRUNTIME_RKNN_INSTALL_DEVEL=ON
+              cmake --build /tmp/ztu-native-release --parallel
+              cmake --install /tmp/ztu-native-release \
+                --prefix "/tmp/${PACKAGE_NAME}"
+              tar -C /tmp -czf "/project/release-assets/${PACKAGE_NAME}.tar.gz" \
                 "${PACKAGE_NAME}"
             '
 
