@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(ztu_somemodelruntime_ez_rknn_async VERSION 0.10.0 LANGUAGES CXX)
+project(ztu_somemodelruntime_ez_rknn_async VERSION 0.11.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

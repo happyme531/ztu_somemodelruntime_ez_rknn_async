@@ -32,7 +32,36 @@ jobs:
       - name: Build Source Distribution
         run: python -m build --sdist --outdir dist
 
-      - name: Build C++ Package
+      - name: Build C++ Package (x86_64)
+        env:
+          PACKAGE_VERSION: ${{ github.ref_name }}
+        run: |
+          PACKAGE_VERSION="${PACKAGE_VERSION#v}"
+          PACKAGE_NAME="ztu_somemodelruntime_rknn-${PACKAGE_VERSION}-linux-x86_64"
+          mkdir -p release-assets
+          docker run --rm --platform linux/amd64 \
+            -e PACKAGE_NAME="${PACKAGE_NAME}" \
+            -v "${PWD}:/project" \
+            -w /project \
+            ubuntu:22.04 \
+            bash -euxc '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                cmake g++ make
+              cmake -S . -B /tmp/ztu-native-release-x86_64 \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DBUILD_TESTING=OFF \
+                -DZTU_SOMEMODELRUNTIME_RKNN_BUILD_PYTHON=OFF \
+                -DZTU_SOMEMODELRUNTIME_RKNN_INSTALL_DEVEL=ON
+              cmake --build /tmp/ztu-native-release-x86_64 --parallel
+              cmake --install /tmp/ztu-native-release-x86_64 \
+                --prefix "/tmp/${PACKAGE_NAME}"
+              tar -C /tmp -czf "/project/release-assets/${PACKAGE_NAME}.tar.gz" \
+                "${PACKAGE_NAME}"
+            '
+
+      - name: Build C++ Package (aarch64)
         env:
           PACKAGE_VERSION: ${{ github.ref_name }}
         run: |
@@ -47,19 +76,15 @@ jobs:
             bash -euxc '
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates cmake curl g++ make
-              curl -fL \
-                https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so \
-                -o /usr/local/lib/librknnrt.so
-              ldconfig
-              cmake -S . -B /tmp/ztu-native-release \
+                cmake g++ make
+              cmake -S . -B /tmp/ztu-native-release-aarch64 \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_LIBDIR=lib \
                 -DBUILD_TESTING=OFF \
                 -DZTU_SOMEMODELRUNTIME_RKNN_BUILD_PYTHON=OFF \
                 -DZTU_SOMEMODELRUNTIME_RKNN_INSTALL_DEVEL=ON
-              cmake --build /tmp/ztu-native-release --parallel
-              cmake --install /tmp/ztu-native-release \
+              cmake --build /tmp/ztu-native-release-aarch64 --parallel
+              cmake --install /tmp/ztu-native-release-aarch64 \
                 --prefix "/tmp/${PACKAGE_NAME}"
               tar -C /tmp -czf "/project/release-assets/${PACKAGE_NAME}.tar.gz" \
                 "${PACKAGE_NAME}"
@@ -67,30 +92,20 @@ jobs:
 
       - name: Build Wheels (Python 3.7-3.13)
         env:
-          CIBW_ARCHS_LINUX: aarch64
+          CIBW_ARCHS_LINUX: x86_64 aarch64
           CIBW_BUILD: cp37-* cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*
           CIBW_SKIP: "*-musllinux_*"
           CIBW_CONFIG_SETTINGS: "cmake.build-type=Release"
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --exclude librknnrt.so"
-          CIBW_BEFORE_ALL_LINUX: >-
-            curl -fL https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so -o /usr/local/lib/librknnrt.so &&
-            chmod 755 /usr/local/lib/librknnrt.so &&
-            ldconfig
         run: |
           python -m pip install --upgrade "cibuildwheel<3"
           python -m cibuildwheel --output-dir wheelhouse
 
       - name: Build Wheels (Python 3.14)
         env:
-          CIBW_ARCHS_LINUX: aarch64
+          CIBW_ARCHS_LINUX: x86_64 aarch64
           CIBW_BUILD: cp314-*
           CIBW_SKIP: "*-musllinux_*"
           CIBW_CONFIG_SETTINGS: "cmake.build-type=Release"
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --exclude librknnrt.so"
-          CIBW_BEFORE_ALL_LINUX: >-
-            curl -fL https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so -o /usr/local/lib/librknnrt.so &&
-            chmod 755 /usr/local/lib/librknnrt.so &&
-            ldconfig
         run: |
           python -m pip install --upgrade "cibuildwheel>=3,<4"
           python -m cibuildwheel --output-dir wheelhouse

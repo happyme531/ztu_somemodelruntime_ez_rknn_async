@@ -57,6 +57,10 @@ names and therefore follows the platform dynamic-linker configuration and
 export LD_LIBRARY_PATH=/path/to/rknn3-api/Linux/aarch64:$LD_LIBRARY_PATH
 ```
 
+Release wheels and C++ packages are built for Linux x86_64 and aarch64. RKNN
+runtime libraries are not linked or bundled; install the matching vendor
+runtime separately on the machine that performs inference.
+
 The initial RKNPU3 implementation intentionally exposes only synchronous,
 single-context native zero-copy inference through `IoBinding`:
 
