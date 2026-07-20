@@ -89,6 +89,13 @@ RKNPU3 tensor shapes in this API are native runtime shapes. In particular, a
 the reported `layout`, `shape`, `strides`, and `aligned_size`; do not assume the
 ONNX shape.
 
+As a temporary compatibility path, copied CPU inputs supplied through
+`bind_cpu_input()` or `OrtValue.ortvalue_from_numpy()` may use 4D NCHW shape
+when the native RKNPU3 input is 5D `NC1HWC2`; the provider packs and
+zero-fills the native buffer. Native OrtValues and dma-bufs still require the
+reported native shape. Exact logical-shape metadata remains unavailable until
+the runtime implements `RKNN3_QUERY_ORIGIN_INPUT_ATTR` correctly.
+
 ## C++ API
 
 The public C++17 API is available from `<ztu/somemodelruntime_rknn.hpp>` in the

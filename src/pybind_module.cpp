@@ -876,7 +876,11 @@ make_session_value(PySession &session, py::array array,
       name, kind,
       session_is_rknpu3 ? smr::MemoryInfo::CreateRknpu3()
                         : smr::MemoryInfo::CreateRknpu2(),
-      smr::TensorElementType::Unknown, std::nullopt, memory_flags);
+      smr::TensorElementType::Unknown,
+      session_is_rknpu3
+          ? std::optional<std::vector<int64_t>>(array_shape(contiguous))
+          : std::nullopt,
+      memory_flags);
   const auto target_type = value.GetTensorTypeAndShapeInfo().GetElementType();
   if (!contiguous.dtype().is(element_to_dtype(target_type)))
     contiguous = py::array::ensure(

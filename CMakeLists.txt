@@ -46,6 +46,10 @@ if(BUILD_TESTING)
     add_executable(ztu_somemodelruntime_rknn_cpp_api_test tests/cpp_api_test.cpp)
     target_link_libraries(ztu_somemodelruntime_rknn_cpp_api_test PRIVATE ztu::somemodelruntime_rknn)
     add_test(NAME ztu_somemodelruntime_rknn_cpp_api_test COMMAND ztu_somemodelruntime_rknn_cpp_api_test)
+
+    add_executable(ztu_somemodelruntime_rknn_rknpu3_layout_test tests/rknpu3_layout_test.cpp)
+    target_include_directories(ztu_somemodelruntime_rknn_rknpu3_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ztu_somemodelruntime_rknn_rknpu3_layout_test COMMAND ztu_somemodelruntime_rknn_rknpu3_layout_test)
 endif()
 
 if(ZTU_SOMEMODELRUNTIME_RKNN_BUILD_PYTHON)

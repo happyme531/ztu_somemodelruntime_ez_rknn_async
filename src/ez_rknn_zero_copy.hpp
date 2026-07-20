@@ -659,7 +659,8 @@ public:
       int32_t offset, std::vector<int64_t> shape, rknn_tensor_type type,
       std::shared_ptr<void> owner, std::function<void()> sync_to_device,
       std::function<void()> sync_from_device, RknnMemoryInfo memory_info,
-      bool dense_linear = true) {
+      bool dense_linear = true,
+      std::function<void(const void *, size_t)> copy_from_host = {}) {
     if (device_type != "rknpu3")
       throw std::runtime_error("unsupported external accelerator type");
     if (virt_addr == nullptr && size != 0)
@@ -678,6 +679,7 @@ public:
     value->external_->sync_from_device = std::move(sync_from_device);
     value->external_->memory_info = std::move(memory_info);
     value->external_->dense_linear = dense_linear;
+    value->external_->copy_from_host = std::move(copy_from_host);
     value->external_->memory_info.device_type = value->device_type_;
     return value;
   }
@@ -886,6 +888,13 @@ public:
       return;
     }
     if (external_) {
+      if (external_->copy_from_host) {
+        if (source_bytes != logical_bytes())
+          throw std::runtime_error("source byte size does not match OrtValue");
+        external_->copy_from_host(source, source_bytes);
+        sync_to_device();
+        return;
+      }
       if (!external_->dense_linear)
         throw std::runtime_error(
             "update_inplace for an internally-strided RKNPU3 tensor is not "
@@ -1194,6 +1203,7 @@ private:
     std::function<void()> sync_from_device;
     RknnMemoryInfo memory_info;
     bool dense_linear = true;
+    std::function<void(const void *, size_t)> copy_from_host;
   };
 
   std::string device_type_;

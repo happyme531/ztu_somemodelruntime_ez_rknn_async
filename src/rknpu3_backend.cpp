@@ -1,4 +1,5 @@
 #include "rknpu3_backend.hpp"
+#include "rknpu3_layout.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -512,7 +513,7 @@ struct Rknpu3Session::Impl {
   std::shared_ptr<RknnOrtValue>
   make_value(const TensorAttr &attr, rknn_tensor_type requested_type,
              uint64_t alloc_flags, const std::vector<int64_t> &shape,
-             TensorMem *mem) {
+             TensorMem *mem, bool copy_nchw_to_nc1hwc2 = false) {
     if (mem == nullptr)
       throw std::runtime_error("RKNPU3 tensor memory allocation/import failed");
     auto state = std::make_shared<ValueMemoryState>();
@@ -555,12 +556,23 @@ struct Rknpu3Session::Impl {
     info.layout = rknpu3_layout_name(attr.layout);
     info.strides = rknpu3_attr_strides(attr);
 
+    std::function<void(const void *, size_t)> copy_from_host;
+    if (copy_nchw_to_nc1hwc2) {
+      const size_t element_size = rknn_tensor_type_size(actual_type);
+      copy_from_host = [state, shape, element_size](const void *source,
+                                                    size_t source_bytes) {
+        copy_nchw_to_rknpu3_nc1hwc2(
+            source, source_bytes, shape, state->mem->virt_addr,
+            static_cast<size_t>(state->mem->size), element_size, state->attr);
+      };
+    }
+
     return RknnOrtValue::from_external_accelerator(
         "rknpu3", mem->virt_addr, static_cast<size_t>(mem->size), mem->fd,
         static_cast<int32_t>(mem->offset), shape, actual_type, state,
         [state] { state->sync(MemorySyncMode::ToDevice); },
         [state] { state->sync(MemorySyncMode::FromDevice); }, std::move(info),
-        attr_is_dense_linear(attr));
+        attr_is_dense_linear(attr), std::move(copy_from_host));
   }
 
   Rknpu3ProviderOptions options;
@@ -628,16 +640,27 @@ std::shared_ptr<RknnOrtValue> Rknpu3Session::create_value_for_io(
   const size_t index = is_input ? input_index(name) : output_index(name);
   const TensorAttr &attr =
       is_input ? impl_->input_attrs.at(index) : impl_->output_attrs.at(index);
-  const auto shape = rknpu3_attr_shape(attr);
-  if (requested_shape && *requested_shape != shape)
-    throw std::runtime_error("RKNPU3 OrtValue shape mismatch for " + name);
+  const auto native_shape = rknpu3_attr_shape(attr);
+  auto value_shape = native_shape;
+  bool copy_nchw_to_nc1hwc2 = false;
+  if (requested_shape && *requested_shape != native_shape) {
+    // TODO(rknpu3-runtime): This is a temporary logical-input escape hatch.
+    // Use RKNN3_QUERY_ORIGIN_INPUT_ATTR for exact shape validation once the
+    // RKCP runtime stops rejecting that documented query.
+    if (!is_input || attr.layout != TensorLayout::Nc1hwc2 ||
+        requested_shape->size() != 4)
+      throw std::runtime_error("RKNPU3 OrtValue shape mismatch for " + name);
+    value_shape = *requested_shape;
+    copy_nchw_to_nc1hwc2 = true;
+  }
   if ((alloc_flags & ~uint64_t{3}) != 0)
     throw std::runtime_error(
         "RKNPU3 supports cacheable/non-cacheable memory flags only");
   TensorMem *mem = impl_->api->create_mem(
       impl_->context->context, attr.aligned_size, attr.core_id,
       static_cast<MemoryAllocFlags>(alloc_flags));
-  return impl_->make_value(attr, requested_type, alloc_flags, shape, mem);
+  return impl_->make_value(attr, requested_type, alloc_flags, value_shape, mem,
+                           copy_nchw_to_nc1hwc2);
 }
 
 std::shared_ptr<RknnOrtValue> Rknpu3Session::create_value_from_fd(
@@ -669,7 +692,8 @@ void Rknpu3IoBinding::bind_cpu_input(
   if (!cpu_value || !cpu_value->is_cpu())
     throw std::runtime_error("bind_cpu_input requires a CPU OrtValue");
   auto value = session_->create_value_for_io(
-      name, true, RKNN_TENSOR_TYPE_MAX, RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
+      name, true, RKNN_TENSOR_TYPE_MAX, RKNN_FLAG_MEMORY_FLAGS_DEFAULT,
+      cpu_value->shape());
   value->update_inplace(reinterpret_cast<const void *>(cpu_value->data_ptr()),
                         cpu_value->logical_bytes(), cpu_value->shape(),
                         cpu_value->element_type());
