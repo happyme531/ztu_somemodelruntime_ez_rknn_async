@@ -2,6 +2,7 @@
 
 #include "ez_rknn_async.hpp"
 #include "ez_rknn_zero_copy.hpp"
+#include "rknpu3_backend.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <mutex>
@@ -24,6 +26,8 @@ using ztu::rk::AsyncEzRknn;
 using ztu::rk::RknnContextHolder;
 using ztu::rk::RknnIoBinding;
 using ztu::rk::RknnOrtValue;
+using ztu::rk::Rknpu3IoBinding;
+using ztu::rk::Rknpu3Session;
 using ztu::rk::ZeroCopyEzRknn;
 using ztu::rk::ZeroCopyInputLayout;
 using ztu::rk::ZeroCopyLayoutMode;
@@ -31,6 +35,51 @@ using ztu::rk::attr_shape_i64;
 using ztu::rk::require_shape_matches;
 using ztu::rk::rknn_tensor_type_size;
 using ztu::rk::shape_to_string;
+
+ExecutionProvider detect_model_provider(const void *data, size_t size) {
+  if (data == nullptr || size < 4)
+    throw Exception("RKNN model is too small to contain a valid header");
+  const auto *magic = static_cast<const uint8_t *>(data);
+  if (std::memcmp(magic, "RKNN", 4) == 0)
+    return ExecutionProvider::Rknpu2;
+  if (std::memcmp(magic, "RKNX", 4) == 0)
+    return ExecutionProvider::Rknpu3;
+  std::ostringstream text;
+  text << "Unknown RKNN model magic: ";
+  for (size_t i = 0; i < 4; ++i) {
+    if (i != 0)
+      text << ' ';
+    text << std::hex << static_cast<unsigned>(magic[i]);
+  }
+  throw Exception(text.str());
+}
+
+ExecutionProvider detect_model_provider(const std::filesystem::path &path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream)
+    throw Exception("Unable to open RKNN model: " + path.string());
+  std::array<uint8_t, 4> magic = {};
+  stream.read(reinterpret_cast<char *>(magic.data()), magic.size());
+  if (stream.gcount() != static_cast<std::streamsize>(magic.size()))
+    throw Exception("RKNN model is too small: " + path.string());
+  return detect_model_provider(magic.data(), magic.size());
+}
+
+ExecutionProvider select_model_provider(ExecutionProvider requested,
+                                        ExecutionProvider detected) {
+  if (requested == ExecutionProvider::Auto)
+    return detected;
+  if (requested != detected) {
+    const char *requested_name =
+        requested == ExecutionProvider::Rknpu2 ? "RKNPU2" : "RKNPU3";
+    const char *detected_name =
+        detected == ExecutionProvider::Rknpu2 ? "RKNPU2" : "RKNPU3";
+    throw Exception(std::string("Provider/model mismatch: requested ") +
+                    requested_name + " but the model header is " +
+                    detected_name);
+  }
+  return requested;
+}
 
 rknn_tensor_type to_rknn_type(TensorElementType type) {
   switch (type) {
@@ -183,8 +232,31 @@ build_node_args(const std::vector<rknn_tensor_attr> &attrs,
   std::vector<NodeArg> result;
   result.reserve(attrs.size());
   for (size_t i = 0; i < attrs.size(); ++i) {
+    std::string layout = "UNDEFINED";
+    if (attrs[i].fmt == RKNN_TENSOR_NCHW)
+      layout = "NCHW";
+    else if (attrs[i].fmt == RKNN_TENSOR_NHWC)
+      layout = "NHWC";
+    else if (attrs[i].fmt == RKNN_TENSOR_NC1HWC2)
+      layout = "NC1HWC2";
     result.push_back(NodeArg{names.at(i), attr_shape_i64(attrs[i]),
-                             onnx_type_string(attrs[i].type)});
+                             onnx_type_string(attrs[i].type),
+                             std::move(layout), {}});
+  }
+  return result;
+}
+
+std::vector<NodeArg> build_rknpu3_node_args(
+    const std::vector<ztu::rk::rknpu3_abi::TensorAttr> &attrs,
+    const std::vector<std::string> &names) {
+  std::vector<NodeArg> result;
+  result.reserve(attrs.size());
+  for (size_t i = 0; i < attrs.size(); ++i) {
+    const auto type = ztu::rk::rknpu3_attr_rknpu2_compatible_type(attrs[i]);
+    result.push_back(NodeArg{
+        names.at(i), ztu::rk::rknpu3_attr_shape(attrs[i]),
+        onnx_type_string(type), ztu::rk::rknpu3_layout_name(attrs[i].layout),
+        ztu::rk::rknpu3_attr_strides(attrs[i])});
   }
   return result;
 }
@@ -222,6 +294,16 @@ void Env::SetWarningHandler(WarningHandler handler) {
 SessionOptions::SessionOptions() = default;
 
 SessionOptions &
+SessionOptions::SetExecutionProvider(ExecutionProvider provider) {
+  provider_ = provider;
+  return *this;
+}
+
+ExecutionProvider SessionOptions::GetExecutionProvider() const {
+  return provider_;
+}
+
+SessionOptions &
 SessionOptions::SetRknnProviderOptions(const RknnProviderOptions &options) {
   options_ = options;
   return *this;
@@ -229,6 +311,17 @@ SessionOptions::SetRknnProviderOptions(const RknnProviderOptions &options) {
 
 const RknnProviderOptions &SessionOptions::GetRknnProviderOptions() const {
   return options_;
+}
+
+SessionOptions &SessionOptions::SetRknpu3ProviderOptions(
+    const Rknpu3ProviderOptions &options) {
+  rknpu3_options_ = options;
+  return *this;
+}
+
+const Rknpu3ProviderOptions &
+SessionOptions::GetRknpu3ProviderOptions() const {
+  return rknpu3_options_;
 }
 
 RunOptions &RunOptions::AddConfigEntry(std::string key, std::string value) {
@@ -254,8 +347,20 @@ MemoryInfo MemoryInfo::CreateRknpu2(int device_id) {
   return MemoryInfo(DeviceType::Rknpu2, device_id);
 }
 
+MemoryInfo MemoryInfo::CreateRknpu3(int device_id) {
+  return MemoryInfo(DeviceType::Rknpu3, device_id);
+}
+
 const char *MemoryInfo::GetName() const noexcept {
-  return device_type_ == DeviceType::Cpu ? "cpu" : "rknpu2";
+  switch (device_type_) {
+  case DeviceType::Cpu:
+    return "cpu";
+  case DeviceType::Rknpu2:
+    return "rknpu2";
+  case DeviceType::Rknpu3:
+    return "rknpu3";
+  }
+  return "unknown";
 }
 
 TensorTypeAndShapeInfo::TensorTypeAndShapeInfo(TensorElementType type,
@@ -318,6 +423,10 @@ Value Value::CreateTensorImpl(const MemoryInfo &memory_info, void *data,
     return Value(RknnOrtValue::from_cpu_buffer(data, bytes, std::move(dims),
                                                native_type));
   }
+  if (memory_info.GetDeviceType() == DeviceType::Rknpu3) {
+    throw Exception("Standalone RKNPU3 tensors require a session/name/io_kind; "
+                    "use Session::CreateIoValue");
+  }
   auto value = RknnOrtValue::create_generic_rknn(std::move(dims), native_type,
                                                   0);
   value->update_inplace(data, bytes, value->shape(), native_type);
@@ -374,8 +483,12 @@ ValueMemoryInfo Value::GetMemoryInfo() const {
     throw Exception("Value is empty");
   const auto info = impl_->memory_info();
   ValueMemoryInfo result;
-  result.device_type = info.device_type == "rknpu2" ? DeviceType::Rknpu2
-                                                     : DeviceType::Cpu;
+  if (info.device_type == "rknpu2")
+    result.device_type = DeviceType::Rknpu2;
+  else if (info.device_type == "rknpu3")
+    result.device_type = DeviceType::Rknpu3;
+  else
+    result.device_type = DeviceType::Cpu;
   result.device_id = info.device_id;
   result.size = info.size;
   result.fd = info.fd;
@@ -389,6 +502,10 @@ ValueMemoryInfo Value::GetMemoryInfo() const {
   result.h_stride = info.h_stride;
   result.fmt = info.fmt;
   result.pass_through = info.pass_through;
+  result.aligned_size = info.aligned_size;
+  result.core_id = info.core_id;
+  result.layout = info.layout;
+  result.strides = info.strides;
   return result;
 }
 
@@ -438,9 +555,12 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
       std::pair<AsyncEzRknn::InferenceResponse, std::vector<rknn_tensor_attr>>;
 
   std::shared_ptr<Env::Impl> env;
+  ExecutionProvider provider = ExecutionProvider::Auto;
   RknnProviderOptions options;
+  Rknpu3ProviderOptions rknpu3_options;
   std::shared_ptr<AsyncEzRknn> async;
   std::shared_ptr<ZeroCopyEzRknn> zero_copy;
+  std::shared_ptr<Rknpu3Session> rknpu3;
   std::shared_ptr<Impl> weight_master;
   std::vector<rknn_tensor_attr> input_attrs;
   std::vector<rknn_tensor_attr> output_attrs;
@@ -476,8 +596,12 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   }
 
   template <typename Factory>
-  void initialize(Factory &&factory, const SessionOptions &session_options,
-                  const std::shared_ptr<Impl> &master) {
+  void initialize_rknpu2(Factory &&factory,
+                         const SessionOptions &session_options,
+                         const std::shared_ptr<Impl> &master) {
+    if (master && master->provider != ExecutionProvider::Rknpu2)
+      throw Exception("use_weight_from must refer to an RKNPU2 session");
+    provider = ExecutionProvider::Rknpu2;
     options = session_options.GetRknnProviderOptions();
     if (options.max_queue_size == 0)
       throw Exception("max_queue_size must be > 0");
@@ -560,6 +684,32 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
                                  ? std::string(output_attrs[i].name)
                                  : "output_" + std::to_string(i));
     submit_timeout = std::chrono::milliseconds(options.submit_timeout_ms);
+  }
+
+  void initialize_rknpu3(const SessionOptions &session_options,
+                         const std::string *model_path,
+                         std::vector<uint8_t> model_data = {}) {
+    provider = ExecutionProvider::Rknpu3;
+    rknpu3_options = session_options.GetRknpu3ProviderOptions();
+    auto warning = [env = env](const std::string &message) {
+      if (env && env->warning_handler)
+        env->warning_handler(message);
+    };
+    if (model_path != nullptr)
+      rknpu3 = std::make_shared<Rknpu3Session>(*model_path, rknpu3_options,
+                                               std::move(warning));
+    else
+      rknpu3 = std::make_shared<Rknpu3Session>(
+          std::move(model_data), rknpu3_options, std::move(warning));
+    input_names = rknpu3->input_names();
+    output_names = rknpu3->output_names();
+  }
+
+  void require_rknpu2(const char *operation) const {
+    if (provider != ExecutionProvider::Rknpu2)
+      throw Exception(std::string(operation) +
+                      " is not implemented by the initial RKNPU3 provider; "
+                      "use the single-thread zero-copy IoBinding API");
   }
 
   void warn(const std::string &message) const {
@@ -814,12 +964,21 @@ Session::Session(const Env &env, const char *model_path,
                  const Session *use_weight_from)
     : impl_(std::make_shared<Impl>()) {
   impl_->env = env.impl_;
-  if (use_weight_from)
-    impl_->weight_master = use_weight_from->impl_;
   if (model_path == nullptr)
     throw Exception("model_path is null");
   const std::string path(model_path);
-  impl_->initialize(
+  const auto provider = select_model_provider(
+      options.GetExecutionProvider(),
+      detect_model_provider(std::filesystem::path(path)));
+  if (provider == ExecutionProvider::Rknpu3) {
+    if (use_weight_from)
+      throw Exception("use_weight_from is supported by RKNPU2 only");
+    impl_->initialize_rknpu3(options, &path);
+    return;
+  }
+  if (use_weight_from)
+    impl_->weight_master = use_weight_from->impl_;
+  impl_->initialize_rknpu2(
       [impl = impl_, path](AsyncEzRknn::Layout layout,
                            std::optional<rknn_core_mask> mask,
                            bool disable_dup,
@@ -840,13 +999,22 @@ Session::Session(const Env &env, const void *model_data, size_t model_size,
                  const Session *use_weight_from)
     : impl_(std::make_shared<Impl>()) {
   impl_->env = env.impl_;
-  if (use_weight_from)
-    impl_->weight_master = use_weight_from->impl_;
   if (model_data == nullptr || model_size == 0)
     throw Exception("model data must not be empty");
+  const auto provider = select_model_provider(
+      options.GetExecutionProvider(), detect_model_provider(model_data,
+                                                             model_size));
   std::vector<uint8_t> bytes(model_size);
   std::memcpy(bytes.data(), model_data, model_size);
-  impl_->initialize(
+  if (provider == ExecutionProvider::Rknpu3) {
+    if (use_weight_from)
+      throw Exception("use_weight_from is supported by RKNPU2 only");
+    impl_->initialize_rknpu3(options, nullptr, std::move(bytes));
+    return;
+  }
+  if (use_weight_from)
+    impl_->weight_master = use_weight_from->impl_;
+  impl_->initialize_rknpu2(
       [impl = impl_, bytes = std::move(bytes)](
           AsyncEzRknn::Layout layout, std::optional<rknn_core_mask> mask,
           bool disable_dup, std::optional<rknn_context> master,
@@ -879,6 +1047,7 @@ std::vector<Value>
 Session::Run(const RunOptions &run_options, const char *const *input_names,
              const Value *input_values, size_t input_count,
              const char *const *output_names, size_t output_count) {
+  impl_->require_rknpu2("regular Run");
   const bool batch = run_options.GetDispatchBatch();
   auto indices = impl_->output_indices(output_names, output_count);
   auto prepared =
@@ -910,6 +1079,7 @@ void Session::RunAsync(const RunOptions &run_options,
                        const char *const *output_names, Value *output_values,
                        size_t output_count, RunAsyncCallbackFn callback,
                        void *user_data) {
+  impl_->require_rknpu2("RunAsync");
   if (callback == nullptr)
     throw Exception("callback must not be null");
   if (run_options.GetDispatchBatch())
@@ -966,6 +1136,7 @@ void Session::RunAsync(const RunOptions &run_options,
 std::optional<std::vector<Value>>
 Session::RunPipeline(const char *const *input_names, const Value *input_values,
                      size_t input_count, size_t depth, bool reset) {
+  impl_->require_rknpu2("RunPipeline");
   if (depth == 0)
     throw Exception("pipeline depth must be > 0");
   auto prepared =
@@ -1003,41 +1174,86 @@ const std::string &Session::GetOutputName(size_t index) const {
 }
 
 TypeInfo Session::GetInputTypeInfo(size_t index) const {
+  if (impl_->provider == ExecutionProvider::Rknpu3) {
+    const auto type = ztu::rk::rknpu3_attr_rknpu2_compatible_type(
+        impl_->rknpu3->input_attrs().at(index));
+    return TypeInfo(TensorTypeAndShapeInfo(
+        from_rknn_type(type), ztu::rk::rknpu3_attr_shape(
+                                  impl_->rknpu3->input_attrs().at(index))));
+  }
   const auto &attr = impl_->input_attrs.at(index);
   return TypeInfo(TensorTypeAndShapeInfo(from_rknn_type(attr.type),
                                          attr_shape_i64(attr)));
 }
 
 TypeInfo Session::GetOutputTypeInfo(size_t index) const {
+  if (impl_->provider == ExecutionProvider::Rknpu3) {
+    const auto type = ztu::rk::rknpu3_attr_rknpu2_compatible_type(
+        impl_->rknpu3->output_attrs().at(index));
+    return TypeInfo(TensorTypeAndShapeInfo(
+        from_rknn_type(type), ztu::rk::rknpu3_attr_shape(
+                                  impl_->rknpu3->output_attrs().at(index))));
+  }
   const auto &attr = impl_->output_attrs.at(index);
   return TypeInfo(TensorTypeAndShapeInfo(from_rknn_type(attr.type),
                                          attr_shape_i64(attr)));
 }
 
 std::vector<NodeArg> Session::GetInputs() const {
+  if (impl_->provider == ExecutionProvider::Rknpu3)
+    return build_rknpu3_node_args(impl_->rknpu3->input_attrs(),
+                                  impl_->input_names);
   return build_node_args(impl_->input_attrs, impl_->input_names);
 }
 
 std::vector<NodeArg> Session::GetOutputs() const {
+  if (impl_->provider == ExecutionProvider::Rknpu3)
+    return build_rknpu3_node_args(impl_->rknpu3->output_attrs(),
+                                  impl_->output_names);
   return build_node_args(impl_->output_attrs, impl_->output_names);
 }
 
 std::vector<NodeArg> Session::GetNativeInputs() const {
+  if (impl_->provider == ExecutionProvider::Rknpu3)
+    return GetInputs();
   return build_node_args(impl_->zero_copy->native_input_attrs(),
                          impl_->zero_copy->input_names());
 }
 
 std::vector<NodeArg> Session::GetNativeOutputs() const {
+  if (impl_->provider == ExecutionProvider::Rknpu3)
+    return GetOutputs();
   return build_node_args(impl_->zero_copy->native_output_attrs(),
                          impl_->zero_copy->output_names());
 }
 
 ModelMetadata Session::GetModelMetadata() const {
   ModelMetadata result;
+  if (impl_->provider == ExecutionProvider::Rknpu3) {
+    if (!impl_->rknpu3->custom_string().empty())
+      result.custom_metadata_map["rknn_custom_string"] =
+          impl_->rknpu3->custom_string();
+    if (!impl_->rknpu3->runtime_version().empty())
+      result.custom_metadata_map["rknpu3_runtime_version"] =
+          impl_->rknpu3->runtime_version();
+    return result;
+  }
   if (!impl_->async->custom_string().empty())
     result.custom_metadata_map["rknn_custom_string"] =
         impl_->async->custom_string();
   return result;
+}
+
+const char *Session::GetExecutionProviderName() const noexcept {
+  return impl_ && impl_->provider == ExecutionProvider::Rknpu3
+             ? "RKNPU3ExecutionProvider"
+             : "RKNPU2ExecutionProvider";
+}
+
+DeviceType Session::GetDeviceType() const noexcept {
+  return impl_ && impl_->provider == ExecutionProvider::Rknpu3
+             ? DeviceType::Rknpu3
+             : DeviceType::Rknpu2;
 }
 
 Value Session::CreateIoValue(std::string_view name, IoKind kind,
@@ -1049,6 +1265,29 @@ Value Session::CreateIoValue(std::string_view name, IoKind kind,
     throw Exception("RKNN supports device_id 0 only");
   const std::string io_kind = kind == IoKind::Input ? "input" : "output";
   const auto native_type = to_rknn_type(type);
+  if (impl_->provider == ExecutionProvider::Rknpu3) {
+    if (memory_info.GetDeviceType() == DeviceType::Rknpu2)
+      throw Exception("An RKNPU3 session cannot allocate an RKNPU2 OrtValue");
+    if (memory_info.GetDeviceType() == DeviceType::Cpu) {
+      const size_t index = kind == IoKind::Input
+                               ? impl_->rknpu3->input_index(std::string(name))
+                               : impl_->rknpu3->output_index(std::string(name));
+      const auto &attr = kind == IoKind::Input
+                             ? impl_->rknpu3->input_attrs().at(index)
+                             : impl_->rknpu3->output_attrs().at(index);
+      auto dims = shape.value_or(ztu::rk::rknpu3_attr_shape(attr));
+      const auto actual_type =
+          native_type == RKNN_TENSOR_TYPE_MAX
+              ? ztu::rk::rknpu3_attr_rknpu2_compatible_type(attr)
+              : native_type;
+      return Value(RknnOrtValue::allocate_cpu(std::move(dims), actual_type));
+    }
+    return Value(impl_->rknpu3->create_value_for_io(
+        std::string(name), kind == IoKind::Input, native_type, memory_flags,
+        shape));
+  }
+  if (memory_info.GetDeviceType() == DeviceType::Rknpu3)
+    throw Exception("An RKNPU2 session cannot allocate an RKNPU3 OrtValue");
   if (memory_info.GetDeviceType() == DeviceType::Cpu) {
     const auto &attr = kind == IoKind::Input
                            ? impl_->zero_copy->logical_input_attr(
@@ -1068,8 +1307,14 @@ Value Session::CreateIoValueFromDmaBuf(
     std::string_view name, IoKind kind, int fd, size_t size,
     TensorElementType type, std::optional<std::vector<int64_t>> shape,
     int32_t offset, void *virt_addr) {
-  if (size > std::numeric_limits<uint32_t>::max())
-    throw Exception("dma-buf size is too large");
+  if (size > std::numeric_limits<uint32_t>::max() &&
+      impl_->provider == ExecutionProvider::Rknpu2)
+    throw Exception("dma-buf size is too large for RKNPU2");
+  if (impl_->provider == ExecutionProvider::Rknpu3) {
+    return Value(impl_->rknpu3->create_value_from_fd(
+        std::string(name), kind == IoKind::Input, to_rknn_type(type), fd,
+        virt_addr, size, offset, shape));
+  }
   return Value(impl_->zero_copy->create_value_from_fd(
       std::string(name), kind == IoKind::Input ? "input" : "output",
       to_rknn_type(type), fd, virt_addr, static_cast<uint32_t>(size), offset,
@@ -1079,13 +1324,18 @@ Value Session::CreateIoValueFromDmaBuf(
 struct IoBinding::Impl {
   std::shared_ptr<Session::Impl> session;
   std::shared_ptr<RknnIoBinding> binding;
+  std::shared_ptr<Rknpu3IoBinding> rknpu3_binding;
   std::vector<DeviceType> output_devices;
   std::set<size_t> requested_output_indices;
 };
 
 IoBinding::IoBinding(Session &session) : impl_(std::make_shared<Impl>()) {
   impl_->session = session.impl_;
-  impl_->binding = std::make_shared<RknnIoBinding>(session.impl_->zero_copy);
+  if (session.impl_->provider == ExecutionProvider::Rknpu3)
+    impl_->rknpu3_binding =
+        std::make_shared<Rknpu3IoBinding>(session.impl_->rknpu3);
+  else
+    impl_->binding = std::make_shared<RknnIoBinding>(session.impl_->zero_copy);
 }
 
 IoBinding::~IoBinding() = default;
@@ -1093,10 +1343,17 @@ IoBinding::~IoBinding() = default;
 void IoBinding::BindInput(const char *name, const Value &value) {
   if (name == nullptr || !value.impl_)
     throw Exception("invalid input binding");
-  if (value.impl_->is_cpu())
-    impl_->binding->bind_cpu_input(name, value.impl_);
-  else
-    impl_->binding->bind_ortvalue_input(name, value.impl_);
+  if (impl_->session->provider == ExecutionProvider::Rknpu3) {
+    if (value.impl_->is_cpu())
+      impl_->rknpu3_binding->bind_cpu_input(name, value.impl_);
+    else
+      impl_->rknpu3_binding->bind_ortvalue_input(name, value.impl_);
+  } else {
+    if (value.impl_->is_cpu())
+      impl_->binding->bind_cpu_input(name, value.impl_);
+    else
+      impl_->binding->bind_ortvalue_input(name, value.impl_);
+  }
 }
 
 void IoBinding::BindOutput(const char *name, const Value &value) {
@@ -1105,45 +1362,79 @@ void IoBinding::BindOutput(const char *name, const Value &value) {
   if (value.impl_->is_cpu())
     throw Exception("preallocated CPU output binding is not supported; bind "
                     "MemoryInfo::CreateCpu() instead");
-  const size_t idx = impl_->session->zero_copy->output_index(name);
-  impl_->binding->bind_ortvalue_output(name, value.impl_);
+  const bool rknpu3 =
+      impl_->session->provider == ExecutionProvider::Rknpu3;
+  const size_t idx = rknpu3 ? impl_->session->rknpu3->output_index(name)
+                            : impl_->session->zero_copy->output_index(name);
+  if (rknpu3)
+    impl_->rknpu3_binding->bind_ortvalue_output(name, value.impl_);
+  else
+    impl_->binding->bind_ortvalue_output(name, value.impl_);
   impl_->requested_output_indices.insert(idx);
-  impl_->output_devices.push_back(DeviceType::Rknpu2);
+  impl_->output_devices.push_back(rknpu3 ? DeviceType::Rknpu3
+                                         : DeviceType::Rknpu2);
 }
 
 void IoBinding::BindOutput(const char *name,
                            const MemoryInfo &memory_info) {
   if (name == nullptr)
     throw Exception("output name is null");
-  const size_t idx = impl_->session->zero_copy->output_index(name);
-  impl_->binding->bind_output(name, memory_info.GetName(),
-                              memory_info.GetDeviceId(), std::nullopt,
-                              std::nullopt, std::nullopt,
-                              RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
+  const bool rknpu3 =
+      impl_->session->provider == ExecutionProvider::Rknpu3;
+  const DeviceType expected =
+      rknpu3 ? DeviceType::Rknpu3 : DeviceType::Rknpu2;
+  if (memory_info.GetDeviceType() != DeviceType::Cpu &&
+      memory_info.GetDeviceType() != expected)
+    throw Exception("Output MemoryInfo backend does not match the session "
+                    "execution provider");
+  const size_t idx = rknpu3 ? impl_->session->rknpu3->output_index(name)
+                            : impl_->session->zero_copy->output_index(name);
+  if (rknpu3)
+    impl_->rknpu3_binding->bind_output(
+        name, memory_info.GetName(), memory_info.GetDeviceId(), std::nullopt,
+        std::nullopt, std::nullopt, RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
+  else
+    impl_->binding->bind_output(
+        name, memory_info.GetName(), memory_info.GetDeviceId(), std::nullopt,
+        std::nullopt, std::nullopt, RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
   impl_->requested_output_indices.insert(idx);
   impl_->output_devices.push_back(memory_info.GetDeviceType());
 }
 
 void IoBinding::ClearBoundInputs() {
-  impl_->binding->clear_binding_inputs();
+  if (impl_->rknpu3_binding)
+    impl_->rknpu3_binding->clear_binding_inputs();
+  else
+    impl_->binding->clear_binding_inputs();
 }
 
 void IoBinding::ClearBoundOutputs() {
-  impl_->binding->clear_binding_outputs();
+  if (impl_->rknpu3_binding)
+    impl_->rknpu3_binding->clear_binding_outputs();
+  else
+    impl_->binding->clear_binding_outputs();
   impl_->output_devices.clear();
   impl_->requested_output_indices.clear();
 }
 
 void IoBinding::SynchronizeInputs() {
-  impl_->binding->synchronize_inputs();
+  if (impl_->rknpu3_binding)
+    impl_->rknpu3_binding->synchronize_inputs();
+  else
+    impl_->binding->synchronize_inputs();
 }
 
 void IoBinding::SynchronizeOutputs() {
-  impl_->binding->synchronize_outputs();
+  if (impl_->rknpu3_binding)
+    impl_->rknpu3_binding->synchronize_outputs();
+  else
+    impl_->binding->synchronize_outputs();
 }
 
 std::vector<Value> IoBinding::GetOutputValues() const {
-  auto native = impl_->binding->get_outputs();
+  auto native = impl_->rknpu3_binding
+                    ? impl_->rknpu3_binding->get_outputs()
+                    : impl_->binding->get_outputs();
   std::vector<Value> result;
   const size_t requested = impl_->output_devices.size();
   result.reserve(requested);
@@ -1165,14 +1456,23 @@ void Session::Run(const RunOptions &run_options, IoBinding &binding) {
   (void)run_options;
   if (!binding.impl_ || binding.impl_->session.get() != impl_.get())
     throw Exception("IoBinding belongs to a different session");
+  const bool rknpu3 = impl_->provider == ExecutionProvider::Rknpu3;
   for (size_t i = 0; i < impl_->output_names.size(); ++i) {
     if (!binding.impl_->requested_output_indices.count(i)) {
-      binding.impl_->binding->bind_output(
-          impl_->output_names[i], "rknpu2", 0, std::nullopt, std::nullopt,
-          std::nullopt, RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
+      if (rknpu3)
+        binding.impl_->rknpu3_binding->bind_output(
+            impl_->output_names[i], "rknpu3", 0, std::nullopt, std::nullopt,
+            std::nullopt, RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
+      else
+        binding.impl_->binding->bind_output(
+            impl_->output_names[i], "rknpu2", 0, std::nullopt, std::nullopt,
+            std::nullopt, RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
     }
   }
-  impl_->zero_copy->run_with_iobinding(*binding.impl_->binding);
+  if (rknpu3)
+    impl_->rknpu3->run_with_iobinding(*binding.impl_->rknpu3_binding);
+  else
+    impl_->zero_copy->run_with_iobinding(*binding.impl_->binding);
 }
 
 } // namespace ztu::somemodelruntime::rknn

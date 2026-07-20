@@ -35,5 +35,16 @@ int main() {
   run_options.SetDispatchBatch(true);
   assert(run_options.GetDispatchBatch());
   assert(std::string(Ort::MemoryInfo::CreateRknpu2().GetName()) == "rknpu2");
+  assert(std::string(Ort::MemoryInfo::CreateRknpu3().GetName()) == "rknpu3");
+
+  Ort::SessionOptions session_options;
+  assert(session_options.GetExecutionProvider() == Ort::ExecutionProvider::Auto);
+  Ort::Rknpu3ProviderOptions rknpu3_options;
+  rknpu3_options.run_core_mask = 3;
+  session_options.SetExecutionProvider(Ort::ExecutionProvider::Rknpu3)
+      .SetRknpu3ProviderOptions(rknpu3_options);
+  assert(session_options.GetExecutionProvider() ==
+         Ort::ExecutionProvider::Rknpu3);
+  assert(session_options.GetRknpu3ProviderOptions().run_core_mask == 3);
   return 0;
 }

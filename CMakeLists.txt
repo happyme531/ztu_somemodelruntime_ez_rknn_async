@@ -18,9 +18,11 @@ if(CMAKE_BUILD_TYPE MATCHES "Release")
 endif()
 
 find_package(Threads REQUIRED)
-find_library(RKNNRT_LIBRARY NAMES rknnrt REQUIRED)
 
-add_library(ztu_somemodelruntime_rknn SHARED src/somemodelruntime_rknn.cpp)
+add_library(ztu_somemodelruntime_rknn SHARED
+    src/rknpu2_runtime_loader.cpp
+    src/rknpu3_backend.cpp
+    src/somemodelruntime_rknn.cpp)
 add_library(ztu::somemodelruntime_rknn ALIAS ztu_somemodelruntime_rknn)
 set_target_properties(ztu_somemodelruntime_rknn PROPERTIES
     EXPORT_NAME somemodelruntime_rknn
@@ -38,7 +40,7 @@ target_include_directories(ztu_somemodelruntime_rknn
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(ztu_somemodelruntime_rknn PRIVATE ${RKNNRT_LIBRARY} Threads::Threads dl)
+target_link_libraries(ztu_somemodelruntime_rknn PRIVATE Threads::Threads dl)
 
 if(BUILD_TESTING)
     add_executable(ztu_somemodelruntime_rknn_cpp_api_test tests/cpp_api_test.cpp)

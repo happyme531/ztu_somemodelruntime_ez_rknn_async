@@ -28,6 +28,8 @@ namespace ztu::rk {
 class RknnOrtValue;
 class RknnIoBinding;
 class ZeroCopyEzRknn;
+class Rknpu3IoBinding;
+class Rknpu3Session;
 } // namespace ztu::rk
 
 namespace ztu::somemodelruntime::rknn {
@@ -58,7 +60,8 @@ struct Float16_t {
   uint16_t value = 0;
 };
 
-enum class DeviceType { Cpu, Rknpu2 };
+enum class DeviceType { Cpu, Rknpu2, Rknpu3 };
+enum class ExecutionProvider { Auto, Rknpu2, Rknpu3 };
 enum class IoKind { Input, Output };
 enum class Layout { Nchw, NchwSoftware, Nhwc, Any };
 enum class ZeroCopyLayout { Nhwc, Native };
@@ -79,6 +82,17 @@ struct ZTU_SOMEMODELRUNTIME_RKNN_API RknnProviderOptions {
   bool custom_op_default_path = false;
 };
 
+using Rknpu2ProviderOptions = RknnProviderOptions;
+
+struct ZTU_SOMEMODELRUNTIME_RKNN_API Rknpu3ProviderOptions {
+  std::optional<std::string> runtime_library;
+  std::optional<std::string> device_id;
+  std::optional<std::string> weight_path;
+  int32_t priority = 0;
+  uint32_t run_timeout_ms = 0;
+  uint32_t run_core_mask = 0;
+};
+
 class ZTU_SOMEMODELRUNTIME_RKNN_API Env {
 public:
   struct Impl;
@@ -95,11 +109,18 @@ private:
 class ZTU_SOMEMODELRUNTIME_RKNN_API SessionOptions {
 public:
   SessionOptions();
+  SessionOptions &SetExecutionProvider(ExecutionProvider provider);
+  ExecutionProvider GetExecutionProvider() const;
   SessionOptions &SetRknnProviderOptions(const RknnProviderOptions &options);
   const RknnProviderOptions &GetRknnProviderOptions() const;
+  SessionOptions &
+  SetRknpu3ProviderOptions(const Rknpu3ProviderOptions &options);
+  const Rknpu3ProviderOptions &GetRknpu3ProviderOptions() const;
 
 private:
+  ExecutionProvider provider_ = ExecutionProvider::Auto;
   RknnProviderOptions options_;
+  Rknpu3ProviderOptions rknpu3_options_;
 };
 
 class ZTU_SOMEMODELRUNTIME_RKNN_API RunOptions {
@@ -117,6 +138,7 @@ class ZTU_SOMEMODELRUNTIME_RKNN_API MemoryInfo {
 public:
   static MemoryInfo CreateCpu(int device_id = 0);
   static MemoryInfo CreateRknpu2(int device_id = 0);
+  static MemoryInfo CreateRknpu3(int device_id = 0);
 
   DeviceType GetDeviceType() const noexcept { return device_type_; }
   int GetDeviceId() const noexcept { return device_id_; }
@@ -157,6 +179,8 @@ struct ZTU_SOMEMODELRUNTIME_RKNN_API NodeArg {
   std::string name;
   std::vector<int64_t> shape;
   std::string type;
+  std::string layout;
+  std::vector<uint64_t> strides;
 };
 
 struct ZTU_SOMEMODELRUNTIME_RKNN_API ModelMetadata {
@@ -178,6 +202,10 @@ struct ZTU_SOMEMODELRUNTIME_RKNN_API ValueMemoryInfo {
   uint32_t h_stride = 0;
   int fmt = 0;
   bool pass_through = false;
+  uint64_t aligned_size = 0;
+  int32_t core_id = -1;
+  std::string layout;
+  std::vector<uint64_t> strides;
 };
 
 class ZTU_SOMEMODELRUNTIME_RKNN_API AllocatorWithDefaultOptions {
@@ -325,6 +353,8 @@ public:
   std::vector<NodeArg> GetNativeInputs() const;
   std::vector<NodeArg> GetNativeOutputs() const;
   ModelMetadata GetModelMetadata() const;
+  const char *GetExecutionProviderName() const noexcept;
+  DeviceType GetDeviceType() const noexcept;
 
   Value CreateIoValue(std::string_view name, IoKind kind,
                       const MemoryInfo &memory_info,

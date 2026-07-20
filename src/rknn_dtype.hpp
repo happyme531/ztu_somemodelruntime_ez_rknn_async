@@ -14,9 +14,11 @@ template <> struct RknnDtype<float> {
   static constexpr rknn_tensor_type type = RKNN_TENSOR_FLOAT32;
 };
 
+#if defined(__arm__) || defined(__aarch64__)
 template <> struct RknnDtype<__fp16> {
   static constexpr rknn_tensor_type type = RKNN_TENSOR_FLOAT16;
 };
+#endif
 
 template <> struct RknnDtype<int8_t> {
   static constexpr rknn_tensor_type type = RKNN_TENSOR_INT8;

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -295,7 +296,7 @@ py::dict extract_provider_options(py::handle object) {
       "provider_options must be a dict or a sequence whose first item is a dict");
 }
 
-smr::RknnProviderOptions parse_provider_options(py::handle object) {
+smr::RknnProviderOptions parse_rknpu2_provider_options(py::handle object) {
   smr::RknnProviderOptions options;
   for (auto item : extract_provider_options(object)) {
     const std::string key = py::cast<std::string>(item.first);
@@ -349,6 +350,173 @@ smr::RknnProviderOptions parse_provider_options(py::handle object) {
     }
   }
   return options;
+}
+
+smr::Rknpu3ProviderOptions parse_rknpu3_provider_options(py::handle object) {
+  smr::Rknpu3ProviderOptions options;
+  for (auto item : extract_provider_options(object)) {
+    const std::string key = py::cast<std::string>(item.first);
+    py::handle value = item.second;
+    if (key == "runtime_library") {
+      options.runtime_library = parse_path(value, key.c_str());
+    } else if (key == "device_id") {
+      if (py::isinstance<py::str>(value))
+        options.device_id = py::cast<std::string>(value);
+      else
+        options.device_id = std::to_string(parse_int(value, key.c_str()));
+    } else if (key == "weight_path") {
+      options.weight_path = parse_path(value, key.c_str());
+    } else if (key == "priority") {
+      const int64_t parsed = parse_int(value, key.c_str());
+      if (parsed < std::numeric_limits<int32_t>::min() ||
+          parsed > std::numeric_limits<int32_t>::max())
+        throw std::runtime_error("priority is out of int32 range");
+      options.priority = static_cast<int32_t>(parsed);
+    } else if (key == "run_timeout_ms") {
+      const int64_t parsed = parse_int(value, key.c_str());
+      if (parsed < 0 ||
+          static_cast<uint64_t>(parsed) >
+              std::numeric_limits<uint32_t>::max())
+        throw std::runtime_error("run_timeout_ms is out of uint32 range");
+      options.run_timeout_ms = static_cast<uint32_t>(parsed);
+    } else if (key == "run_core_mask") {
+      int64_t parsed = 0;
+      if (py::isinstance<py::str>(value)) {
+        const std::string text = trim(py::cast<std::string>(value));
+        if (text == "auto")
+          parsed = 0;
+        else if (text == "all")
+          parsed = std::numeric_limits<uint32_t>::max();
+        else
+          parsed = parse_int(value, key.c_str());
+      } else {
+        parsed = parse_int(value, key.c_str());
+      }
+      if (parsed < 0 ||
+          static_cast<uint64_t>(parsed) >
+              std::numeric_limits<uint32_t>::max())
+        throw std::runtime_error("run_core_mask is out of uint32 range");
+      options.run_core_mask = static_cast<uint32_t>(parsed);
+    } else {
+      throw std::runtime_error("Unknown RKNPU3 provider_options key: " + key);
+    }
+  }
+  return options;
+}
+
+bool is_rknpu2_option(const std::string &key) {
+  static const std::vector<std::string> keys = {
+      "layout",
+      "zero_copy_layout",
+      "max_queue_size",
+      "threads_per_core",
+      "submit_timeout_ms",
+      "sequential_callbacks",
+      "schedule",
+      "tp_mode",
+      "enable_pacing",
+      "disable_dup_context",
+      "custom_op_path",
+      "custom_op_paths",
+      "custom_op_default_path",
+      "load_custom_ops_from_default_path",
+  };
+  return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
+bool is_rknpu3_option(const std::string &key) {
+  static const std::vector<std::string> keys = {
+      "runtime_library", "device_id",       "weight_path",
+      "priority",        "run_timeout_ms",  "run_core_mask",
+  };
+  return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
+smr::ExecutionProvider parse_provider_name(const std::string &name) {
+  if (name == "RKNPU2ExecutionProvider" ||
+      name == "RKNNExecutionProvider")
+    return smr::ExecutionProvider::Rknpu2;
+  if (name == "RKNPU3ExecutionProvider")
+    return smr::ExecutionProvider::Rknpu3;
+  throw std::runtime_error("Unsupported execution provider: " + name);
+}
+
+struct ParsedProviderConfiguration {
+  smr::SessionOptions session_options;
+  py::dict options;
+};
+
+ParsedProviderConfiguration configure_providers(py::handle providers,
+                                                py::handle provider_options) {
+  ParsedProviderConfiguration result;
+  result.options = extract_provider_options(provider_options);
+  smr::ExecutionProvider provider = smr::ExecutionProvider::Auto;
+
+  if (!providers.is_none()) {
+    py::object provider_spec = py::reinterpret_borrow<py::object>(providers);
+    if (!py::isinstance<py::str>(providers)) {
+      if (!py::isinstance<py::sequence>(providers))
+        throw std::runtime_error("providers must be a string or sequence");
+      py::sequence sequence = py::reinterpret_borrow<py::sequence>(providers);
+      if (sequence.size() == 0)
+        provider_spec = py::none();
+      else {
+        if (sequence.size() != 1)
+          throw std::runtime_error(
+              "exactly one RKNN execution provider is supported per session");
+        provider_spec = py::reinterpret_borrow<py::object>(sequence[0]);
+      }
+    }
+    if (!provider_spec.is_none()) {
+      if (py::isinstance<py::str>(provider_spec)) {
+        provider = parse_provider_name(py::cast<std::string>(provider_spec));
+      } else if (py::isinstance<py::sequence>(provider_spec)) {
+        py::sequence tuple =
+            py::reinterpret_borrow<py::sequence>(provider_spec);
+        if (tuple.size() != 2 || !py::isinstance<py::str>(tuple[0]) ||
+            !py::isinstance<py::dict>(tuple[1]))
+          throw std::runtime_error(
+              "provider tuple must be (provider_name, options_dict)");
+        provider = parse_provider_name(py::cast<std::string>(tuple[0]));
+        py::dict inline_options = tuple[1].cast<py::dict>();
+        if (result.options.size() != 0 && inline_options.size() != 0)
+          throw std::runtime_error(
+              "provider options were supplied both inline and via "
+              "provider_options");
+        if (inline_options.size() != 0)
+          result.options = std::move(inline_options);
+      } else {
+        throw std::runtime_error(
+            "provider entry must be a name or (name, options) tuple");
+      }
+    }
+  }
+
+  result.session_options.SetExecutionProvider(provider);
+  if (provider == smr::ExecutionProvider::Rknpu2) {
+    result.session_options.SetRknnProviderOptions(
+        parse_rknpu2_provider_options(result.options));
+  } else if (provider == smr::ExecutionProvider::Rknpu3) {
+    result.session_options.SetRknpu3ProviderOptions(
+        parse_rknpu3_provider_options(result.options));
+  } else {
+    py::dict rknpu2;
+    py::dict rknpu3;
+    for (auto item : result.options) {
+      const std::string key = py::cast<std::string>(item.first);
+      if (is_rknpu2_option(key))
+        rknpu2[item.first] = item.second;
+      else if (is_rknpu3_option(key))
+        rknpu3[item.first] = item.second;
+      else
+        throw std::runtime_error("Unknown provider_options key: " + key);
+    }
+    result.session_options.SetRknnProviderOptions(
+        parse_rknpu2_provider_options(rknpu2));
+    result.session_options.SetRknpu3ProviderOptions(
+        parse_rknpu3_provider_options(rknpu3));
+  }
+  return result;
 }
 
 smr::RunOptions parse_run_options(py::handle object) {
@@ -452,14 +620,23 @@ public:
                    int device_id, smr::TensorElementType element_type,
                    std::optional<std::vector<int64_t>> shape,
                    uint64_t memory_flags) {
-    const auto info = device_type == "cpu"
-                          ? smr::MemoryInfo::CreateCpu(device_id)
-                          : smr::MemoryInfo::CreateRknpu2(device_id);
-    if (device_type != "cpu" && device_type != "rknpu2")
-      throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
+    const bool session_is_rknpu3 =
+        session_->GetDeviceType() == smr::DeviceType::Rknpu3;
+    const std::string expected = session_is_rknpu3 ? "rknpu3" : "rknpu2";
+    if (device_type != "cpu" && device_type != expected)
+      throw std::runtime_error("device_type must be 'cpu' or '" + expected +
+                               "' for this session");
+    const auto info =
+        device_type == "cpu"
+            ? smr::MemoryInfo::CreateCpu(device_id)
+            : (session_is_rknpu3
+                   ? smr::MemoryInfo::CreateRknpu3(device_id)
+                   : smr::MemoryInfo::CreateRknpu2(device_id));
     if (element_type != smr::TensorElementType::Unknown || shape.has_value()) {
       auto validation = session_->CreateIoValue(
-          name, smr::IoKind::Output, smr::MemoryInfo::CreateRknpu2(),
+          name, smr::IoKind::Output,
+          session_is_rknpu3 ? smr::MemoryInfo::CreateRknpu3()
+                            : smr::MemoryInfo::CreateRknpu2(),
           element_type, shape, memory_flags);
       (void)validation;
     }
@@ -487,21 +664,21 @@ private:
 
 class PySession {
 public:
-  PySession(py::handle path_or_bytes, py::handle provider_options,
-            PySession *weight_master)
+  PySession(py::handle path_or_bytes, py::handle providers,
+            py::handle provider_options, PySession *weight_master)
       : env_("ztu_somemodelruntime_ez_rknn_async") {
     env_.SetWarningHandler(emit_python_warning);
-    smr::SessionOptions options;
-    options.SetRknnProviderOptions(parse_provider_options(provider_options));
+    auto configured = configure_providers(providers, provider_options);
+    provider_options_ = std::move(configured.options);
     if (py::isinstance<py::bytes>(path_or_bytes)) {
       std::string bytes = py::cast<std::string>(path_or_bytes);
       session_ = std::make_shared<smr::Session>(
-          env_, bytes.data(), bytes.size(), options,
+          env_, bytes.data(), bytes.size(), configured.session_options,
           weight_master ? weight_master->session_.get() : nullptr);
     } else {
       const std::string path = parse_path(path_or_bytes, "path_or_bytes");
       session_ = std::make_shared<smr::Session>(
-          env_, path.c_str(), options,
+          env_, path.c_str(), configured.session_options,
           weight_master ? weight_master->session_.get() : nullptr);
     }
   }
@@ -514,6 +691,16 @@ public:
   }
 
   smr::Session &session() { return *session_; }
+
+  std::vector<std::string> providers() const {
+    return {session_->GetExecutionProviderName()};
+  }
+
+  py::dict provider_options() const {
+    py::dict result;
+    result[py::str(session_->GetExecutionProviderName())] = provider_options_;
+    return result;
+  }
 
   PreparedCall prepare_inputs(py::handle input_feed) {
     PreparedCall call;
@@ -666,6 +853,7 @@ public:
 private:
   smr::Env env_;
   std::shared_ptr<smr::Session> session_;
+  py::dict provider_options_;
 };
 
 std::shared_ptr<PyOrtValue>
@@ -678,10 +866,16 @@ make_session_value(PySession &session, py::array array,
     throw std::runtime_error("io_kind must be 'input' or 'output'");
   if (device_type == "cpu")
     return std::make_shared<PyOrtValue>(value_from_array(contiguous), contiguous);
-  if (device_type != "rknpu2")
-    throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
+  const bool session_is_rknpu3 =
+      session.session().GetDeviceType() == smr::DeviceType::Rknpu3;
+  const std::string expected = session_is_rknpu3 ? "rknpu3" : "rknpu2";
+  if (device_type != expected)
+    throw std::runtime_error("device_type must be 'cpu' or '" + expected +
+                             "' for this session");
   auto value = session.session().CreateIoValue(
-      name, kind, smr::MemoryInfo::CreateRknpu2(),
+      name, kind,
+      session_is_rknpu3 ? smr::MemoryInfo::CreateRknpu3()
+                        : smr::MemoryInfo::CreateRknpu2(),
       smr::TensorElementType::Unknown, std::nullopt, memory_flags);
   const auto target_type = value.GetTensorTypeAndShapeInfo().GetElementType();
   if (!contiguous.dtype().is(element_to_dtype(target_type)))
@@ -696,10 +890,13 @@ make_session_value(PySession &session, py::array array,
 py::dict memory_info_dict(const PyOrtValue &value) {
   const auto info = value.value().GetMemoryInfo();
   py::dict result;
-  result["device_type"] =
-      info.device_type == smr::DeviceType::Cpu ? "cpu" : "rknpu2";
+  result["device_type"] = info.device_type == smr::DeviceType::Cpu
+                              ? "cpu"
+                              : (info.device_type == smr::DeviceType::Rknpu3
+                                     ? "rknpu3"
+                                     : "rknpu2");
   result["device_id"] = info.device_id;
-  if (info.device_type == smr::DeviceType::Rknpu2) {
+  if (info.device_type != smr::DeviceType::Cpu) {
     result["size"] = info.size;
     result["fd"] = info.fd;
     result["offset"] = info.offset;
@@ -712,6 +909,10 @@ py::dict memory_info_dict(const PyOrtValue &value) {
     result["h_stride"] = info.h_stride;
     result["fmt"] = info.fmt;
     result["pass_through"] = info.pass_through;
+    result["aligned_size"] = info.aligned_size;
+    result["core_id"] = info.core_id;
+    result["layout"] = info.layout;
+    result["strides"] = info.strides;
   }
   return result;
 }
@@ -730,6 +931,12 @@ PYBIND11_MODULE(_core, module) {
       })
       .def_property_readonly("type", [](const smr::NodeArg &value) {
         return value.type;
+      })
+      .def_property_readonly("layout", [](const smr::NodeArg &value) {
+        return value.layout;
+      })
+      .def_property_readonly("strides", [](const smr::NodeArg &value) {
+        return value.strides;
       });
 
   py::class_<smr::ModelMetadata>(module, "ModelMetadata")
@@ -778,17 +985,37 @@ PYBIND11_MODULE(_core, module) {
               return wrap_value(smr::Value::CreateOwnedTensor(
                   shape.data(), shape.size(), type));
             }
-            if (device_type != "rknpu2")
-              throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
+            if (device_type != "rknpu2" && device_type != "rknpu3")
+              throw std::runtime_error(
+                  "device_type must be 'cpu', 'rknpu2', or 'rknpu3'");
             if (!session.is_none() && !name.is_none() && !io_kind.is_none()) {
+              auto *py_session = session.cast<PySession *>();
+              const bool session_is_rknpu3 =
+                  py_session->session().GetDeviceType() ==
+                  smr::DeviceType::Rknpu3;
+              const std::string expected =
+                  session_is_rknpu3 ? "rknpu3" : "rknpu2";
+              if (device_type != expected)
+                throw std::runtime_error(
+                    "OrtValue device_type does not match session provider; "
+                    "expected '" +
+                    expected + "'");
               const std::string kind_text = py::cast<std::string>(io_kind);
+              if (kind_text != "input" && kind_text != "output")
+                throw std::runtime_error("io_kind must be 'input' or 'output'");
               const auto kind = kind_text == "input" ? smr::IoKind::Input
                                                       : smr::IoKind::Output;
-              return wrap_value(session.cast<PySession *>()->session().CreateIoValue(
+              return wrap_value(py_session->session().CreateIoValue(
                   py::cast<std::string>(name), kind,
-                  smr::MemoryInfo::CreateRknpu2(), type, shape,
+                  session_is_rknpu3 ? smr::MemoryInfo::CreateRknpu3()
+                                    : smr::MemoryInfo::CreateRknpu2(),
+                  type, shape,
                   parse_memory_flags(memory_flags)));
             }
+            if (device_type == "rknpu3")
+              throw std::runtime_error(
+                  "standalone RKNPU3 OrtValue requires session, name, and "
+                  "io_kind");
             std::vector<uint8_t> zeros(
                 smr::TensorTypeAndShapeInfo(type, shape).GetElementCount() *
                 element_to_dtype(type).itemsize());
@@ -804,7 +1031,7 @@ PYBIND11_MODULE(_core, module) {
       .def_static(
           "ortvalue_from_dmabuf",
           [](int fd, py::handle shape_object, py::handle type_object,
-             uint32_t size, int32_t offset, py::object virt_addr,
+             uint64_t size, int32_t offset, py::object virt_addr,
              py::object session, py::object name, py::object io_kind,
              const std::string &) {
             if (session.is_none() || name.is_none() || io_kind.is_none())
@@ -815,11 +1042,16 @@ PYBIND11_MODULE(_core, module) {
               address = reinterpret_cast<void *>(static_cast<uintptr_t>(
                   py::cast<uint64_t>(virt_addr)));
             const std::string kind_text = py::cast<std::string>(io_kind);
+            if (kind_text != "input" && kind_text != "output")
+              throw std::runtime_error("io_kind must be 'input' or 'output'");
             const auto kind = kind_text == "input" ? smr::IoKind::Input
                                                     : smr::IoKind::Output;
+            if (size > std::numeric_limits<size_t>::max())
+              throw std::runtime_error("dma-buf size is too large");
             return wrap_value(
                 session.cast<PySession *>()->session().CreateIoValueFromDmaBuf(
-                    py::cast<std::string>(name), kind, fd, size,
+                    py::cast<std::string>(name), kind, fd,
+                    static_cast<size_t>(size),
                     dtype_like_to_element(type_object), parse_shape(shape_object),
                     offset, address));
           },
@@ -834,14 +1066,18 @@ PYBIND11_MODULE(_core, module) {
         return reinterpret_cast<uintptr_t>(value.value().GetTensorRawData());
       })
       .def("device_name", [](const PyOrtValue &value) {
-        return value.value().GetMemoryInfo().device_type == smr::DeviceType::Cpu
+        const auto type = value.value().GetMemoryInfo().device_type;
+        return type == smr::DeviceType::Cpu
                    ? "cpu"
-                   : "rknpu2";
+                   : (type == smr::DeviceType::Rknpu3 ? "rknpu3"
+                                                       : "rknpu2");
       })
       .def("device_type", [](const PyOrtValue &value) {
-        return value.value().GetMemoryInfo().device_type == smr::DeviceType::Cpu
+        const auto type = value.value().GetMemoryInfo().device_type;
+        return type == smr::DeviceType::Cpu
                    ? "cpu"
-                   : "rknpu2";
+                   : (type == smr::DeviceType::Rknpu3 ? "rknpu3"
+                                                       : "rknpu2");
       })
       .def("device_id", [](const PyOrtValue &value) {
         return value.value().GetMemoryInfo().device_id;
@@ -920,14 +1156,14 @@ PYBIND11_MODULE(_core, module) {
 
   py::class_<PySession>(module, "InferenceSession")
       .def(py::init([](py::handle path_or_bytes, py::handle,
-                       py::handle, py::handle provider_options,
+                       py::handle providers, py::handle provider_options,
                        py::kwargs kwargs) {
         PySession *master = nullptr;
         if (kwargs.contains("use_weight_from") &&
             !kwargs["use_weight_from"].is_none())
           master = kwargs["use_weight_from"].cast<PySession *>();
-        return std::make_unique<PySession>(path_or_bytes, provider_options,
-                                           master);
+        return std::make_unique<PySession>(path_or_bytes, providers,
+                                           provider_options, master);
       }), py::arg("path_or_bytes"), py::arg("sess_options") = py::none(),
            py::arg("providers") = py::none(),
            py::arg("provider_options") = py::none())
@@ -963,6 +1199,8 @@ PYBIND11_MODULE(_core, module) {
       .def("get_modelmeta", [](const PySession &session) {
         return const_cast<PySession &>(session).session().GetModelMetadata();
       })
+      .def("get_providers", &PySession::providers)
+      .def("get_provider_options", &PySession::provider_options)
       .def_property_readonly("input_names", [](const PySession &session) {
         auto &native = const_cast<PySession &>(session).session();
         std::vector<std::string> result;

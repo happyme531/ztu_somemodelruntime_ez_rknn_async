@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
-from .options import RknnProviderOptions, make_provider_options
+from .options import (
+    RknnProviderOptions,
+    Rknpu2ProviderOptions,
+    Rknpu3ProviderOptions,
+    make_provider_options,
+    make_rknpu2_provider_options,
+    make_rknpu3_provider_options,
+)
 
 __version__: str
 
@@ -14,6 +21,10 @@ class NodeArg:
     def shape(self) -> List[int]: ...
     @property
     def type(self) -> str: ...
+    @property
+    def layout(self) -> str: ...
+    @property
+    def strides(self) -> List[int]: ...
 
 class ModelMetadata:
     @property
@@ -118,7 +129,11 @@ class InferenceSession:
         sess_options: Any = ...,
         providers: Any = ...,
         provider_options: Optional[
-            Union[Sequence[RknnProviderOptions], RknnProviderOptions]
+            Union[
+                Sequence[Union[Rknpu2ProviderOptions, Rknpu3ProviderOptions]],
+                Rknpu2ProviderOptions,
+                Rknpu3ProviderOptions,
+            ]
         ] = ...,
         *,
         use_weight_from: Optional["InferenceSession"] = ...,
@@ -153,6 +168,8 @@ class InferenceSession:
     def get_outputs(self) -> List[NodeArg]: ...
     def get_native_inputs(self) -> List[NodeArg]: ...
     def get_native_outputs(self) -> List[NodeArg]: ...
+    def get_providers(self) -> List[str]: ...
+    def get_provider_options(self) -> Dict[str, Dict[str, Any]]: ...
 
     @property
     def input_names(self) -> List[str]: ...

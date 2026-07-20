@@ -11,7 +11,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <fcntl.h>
+#include <functional>
 #include <iostream>
+#include <limits>
 #if defined(__has_include)
 #if __has_include(<linux/dma-heap.h>)
 #include <linux/dma-heap.h>
@@ -522,6 +524,10 @@ struct RknnMemoryInfo {
   uint32_t h_stride = 0;
   int fmt = 0;
   bool pass_through = false;
+  uint64_t aligned_size = 0;
+  int32_t core_id = -1;
+  std::string layout;
+  std::vector<uint64_t> strides;
 };
 
 class RknnOrtValue {
@@ -648,9 +654,41 @@ public:
     return value;
   }
 
+  static std::shared_ptr<RknnOrtValue> from_external_accelerator(
+      std::string device_type, void *virt_addr, size_t size, int fd,
+      int32_t offset, std::vector<int64_t> shape, rknn_tensor_type type,
+      std::shared_ptr<void> owner, std::function<void()> sync_to_device,
+      std::function<void()> sync_from_device, RknnMemoryInfo memory_info,
+      bool dense_linear = true) {
+    if (device_type != "rknpu3")
+      throw std::runtime_error("unsupported external accelerator type");
+    if (virt_addr == nullptr && size != 0)
+      throw std::runtime_error("accelerator tensor data is null");
+    auto value = std::shared_ptr<RknnOrtValue>(new RknnOrtValue());
+    value->device_type_ = std::move(device_type);
+    value->shape_ = std::move(shape);
+    value->type_ = type;
+    value->external_ = std::make_shared<ExternalMemory>();
+    value->external_->virt_addr = virt_addr;
+    value->external_->size = size;
+    value->external_->fd = fd;
+    value->external_->offset = offset;
+    value->external_->owner = std::move(owner);
+    value->external_->sync_to_device = std::move(sync_to_device);
+    value->external_->sync_from_device = std::move(sync_from_device);
+    value->external_->memory_info = std::move(memory_info);
+    value->external_->dense_linear = dense_linear;
+    value->external_->memory_info.device_type = value->device_type_;
+    return value;
+  }
+
   bool is_rknn() const { return device_type_ == "rknpu2"; }
+  bool is_rknpu3() const { return device_type_ == "rknpu3"; }
+  bool is_accelerator() const { return is_rknn() || is_rknpu3(); }
   bool is_cpu() const { return device_type_ == "cpu"; }
-  bool has_value() const { return is_cpu() || buffer_ || !imports_.empty(); }
+  bool has_value() const {
+    return is_cpu() || buffer_ || !imports_.empty() || external_;
+  }
   bool is_tensor() const { return has_value(); }
   const std::string &device_type() const { return device_type_; }
   const std::string &device_name() const { return device_type_; }
@@ -658,6 +696,10 @@ public:
   const std::vector<int64_t> &shape() const { return shape_; }
   rknn_tensor_type element_type() const { return type_; }
   const rknn_tensor_attr &attr() const { return attr_; }
+  const std::shared_ptr<void> &backend_owner() const {
+    static const std::shared_ptr<void> empty;
+    return external_ ? external_->owner : empty;
+  }
 
   void apply_input_binding_attr(const rknn_tensor_attr &native_attr,
                                 const rknn_tensor_attr &logical_attr,
@@ -722,6 +764,11 @@ public:
   }
 
   void sync_to_device() {
+    if (external_) {
+      if (external_->sync_to_device)
+        external_->sync_to_device();
+      return;
+    }
     if (!is_rknn()) {
       return;
     }
@@ -731,6 +778,11 @@ public:
   }
 
   void sync_from_device() {
+    if (external_) {
+      if (external_->sync_from_device)
+        external_->sync_from_device();
+      return;
+    }
     if (!is_rknn()) {
       return;
     }
@@ -760,6 +812,16 @@ public:
           static_cast<uint32_t>(buffer_->size()), buffer_->offset());
       if (mem == nullptr) {
         throw std::runtime_error("rknn_create_mem_from_fd failed");
+      }
+    } else if (external_ && external_->fd >= 0 &&
+               external_->size <= std::numeric_limits<uint32_t>::max()) {
+      mem = rknn_create_mem_from_fd(
+          holder->ctx, external_->fd, external_->virt_addr,
+          static_cast<uint32_t>(external_->size), external_->offset);
+      if (mem == nullptr) {
+        throw std::runtime_error(
+            "rknn_create_mem_from_fd failed while importing an RKNPU3 "
+            "dma-buf into RKNPU2");
       }
     } else {
       throw std::runtime_error(
@@ -823,6 +885,18 @@ public:
       std::memcpy(cpu_data_, source, source_bytes);
       return;
     }
+    if (external_) {
+      if (!external_->dense_linear)
+        throw std::runtime_error(
+            "update_inplace for an internally-strided RKNPU3 tensor is not "
+            "implemented; write the native buffer via data_ptr using the "
+            "reported strides");
+      if (source_bytes != logical_bytes() || source_bytes > external_->size)
+        throw std::runtime_error("source byte size does not match OrtValue");
+      std::memcpy(external_->virt_addr, source, source_bytes);
+      sync_to_device();
+      return;
+    }
     void *dst_ptr = mutable_data_ptr();
     if (!is_rknn() || dst_ptr == nullptr) {
       throw std::runtime_error("OrtValue has no RKNN memory");
@@ -865,6 +939,17 @@ public:
       std::memcpy(destination, cpu_data_, destination_bytes);
       return;
     }
+    if (external_) {
+      if (!external_->dense_linear)
+        throw std::runtime_error(
+            "numpy/copy for an internally-strided RKNPU3 tensor is not "
+            "implemented; access the native buffer and reported strides");
+      if (destination_bytes > external_->size)
+        throw std::runtime_error("OrtValue backing memory is too small");
+      sync_from_device();
+      std::memcpy(destination, external_->virt_addr, destination_bytes);
+      return;
+    }
     void *src_ptr = mutable_data_ptr();
     if (!is_rknn() || src_ptr == nullptr) {
       throw std::runtime_error("OrtValue has no RKNN memory");
@@ -883,7 +968,10 @@ public:
     RknnMemoryInfo info;
     info.device_type = device_type_;
     info.device_id = 0;
-    if (is_rknn()) {
+    if (external_) {
+      info = external_->memory_info;
+      info.import_count += imports_.size();
+    } else if (is_rknn()) {
       info.size = backing_size();
       info.fd = backing_fd();
       info.offset = backing_offset();
@@ -896,6 +984,7 @@ public:
       info.h_stride = attr_.h_stride;
       info.fmt = static_cast<int>(attr_.fmt);
       info.pass_through = static_cast<bool>(attr_.pass_through);
+      info.aligned_size = attr_alloc_bytes(attr_);
     } else {
       info.size = cpu_bytes_;
       info.virt_addr = reinterpret_cast<uintptr_t>(cpu_data_);
@@ -1036,6 +1125,8 @@ private:
   }
 
   void *mutable_data_ptr() const {
+    if (external_)
+      return external_->virt_addr;
     if (buffer_) {
       return buffer_->virt_addr();
     }
@@ -1046,6 +1137,8 @@ private:
   }
 
   size_t backing_size() const {
+    if (external_)
+      return external_->size;
     if (buffer_) {
       return buffer_->size();
     }
@@ -1056,6 +1149,8 @@ private:
   }
 
   int backing_fd() const {
+    if (external_)
+      return external_->fd;
     if (buffer_) {
       return buffer_->fd();
     }
@@ -1066,6 +1161,8 @@ private:
   }
 
   int32_t backing_offset() const {
+    if (external_)
+      return external_->offset;
     if (buffer_) {
       return buffer_->offset();
     }
@@ -1087,7 +1184,20 @@ private:
     imports_[holder->ctx] = std::move(imported);
   }
 
+  struct ExternalMemory {
+    void *virt_addr = nullptr;
+    size_t size = 0;
+    int fd = -1;
+    int32_t offset = 0;
+    std::shared_ptr<void> owner;
+    std::function<void()> sync_to_device;
+    std::function<void()> sync_from_device;
+    RknnMemoryInfo memory_info;
+    bool dense_linear = true;
+  };
+
   std::string device_type_;
+  std::shared_ptr<ExternalMemory> external_;
   void *cpu_data_ = nullptr;
   size_t cpu_bytes_ = 0;
   std::shared_ptr<void> cpu_owner_;

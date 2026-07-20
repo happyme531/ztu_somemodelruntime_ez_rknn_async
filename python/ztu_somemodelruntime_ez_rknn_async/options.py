@@ -23,7 +23,7 @@ ZeroCopyLayoutLike = Literal["nhwc", "native"]
 
 
 class RknnProviderOptions(TypedDict, total=False):
-    """Provider options for RKNN runtime.
+    """Provider options for the RKNPU2 runtime (legacy name).
 
     Notes:
     - Unknown keys are rejected at runtime.
@@ -46,6 +46,20 @@ class RknnProviderOptions(TypedDict, total=False):
     custom_op_paths: Union[PathLikeStr, Sequence[PathLikeStr]]
     custom_op_default_path: bool
     load_custom_ops_from_default_path: bool
+
+
+Rknpu2ProviderOptions = RknnProviderOptions
+
+
+class Rknpu3ProviderOptions(TypedDict, total=False):
+    """Provider options specific to ``RKNPU3ExecutionProvider``."""
+
+    runtime_library: PathLikeStr
+    device_id: Union[str, int]
+    weight_path: PathLikeStr
+    priority: int
+    run_timeout_ms: int
+    run_core_mask: Union[int, Literal["auto", "all"]]
 
 
 def make_provider_options(
@@ -116,4 +130,43 @@ def make_provider_options(
         options["tp_mode"] = tp_mode
     if custom_op_paths is not None:
         options["custom_op_paths"] = custom_op_paths
+    return options
+
+
+make_rknpu2_provider_options = make_provider_options
+
+
+def make_rknpu3_provider_options(
+    *,
+    runtime_library: Union[PathLikeStr, None] = None,
+    device_id: Union[str, int, None] = None,
+    weight_path: Union[PathLikeStr, None] = None,
+    priority: int = 0,
+    run_timeout_ms: int = 0,
+    run_core_mask: Union[int, Literal["auto", "all"]] = "auto",
+) -> Rknpu3ProviderOptions:
+    """Build options for the synchronous, native zero-copy RKNPU3 provider.
+
+    ``weight_path`` normally need not be supplied for a path-based model: the
+    provider requires and automatically selects the same basename with the
+    ``.weight`` suffix. It is required when ``InferenceSession`` receives model
+    bytes. Refusing to run without weights is intentional because RKNN3's
+    streaming mode can otherwise return success with incorrect outputs.
+
+    ``run_core_mask="auto"`` queries the model core count and builds a
+    contiguous mask. This works around RKCP runtime 1.0.4 rejecting the
+    documented numeric AUTO value (zero).
+    """
+
+    options: Rknpu3ProviderOptions = {
+        "priority": priority,
+        "run_timeout_ms": run_timeout_ms,
+        "run_core_mask": run_core_mask,
+    }
+    if runtime_library is not None:
+        options["runtime_library"] = runtime_library
+    if device_id is not None:
+        options["device_id"] = device_id
+    if weight_path is not None:
+        options["weight_path"] = weight_path
     return options

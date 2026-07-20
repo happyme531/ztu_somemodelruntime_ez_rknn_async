@@ -4,7 +4,14 @@ from pathlib import Path
 import re
 
 from ._core import IOBinding, InferenceSession, ModelMetadata, NodeArg, OrtValue, SessionIOBinding
-from .options import RknnProviderOptions, make_provider_options
+from .options import (
+    RknnProviderOptions,
+    Rknpu2ProviderOptions,
+    Rknpu3ProviderOptions,
+    make_provider_options,
+    make_rknpu2_provider_options,
+    make_rknpu3_provider_options,
+)
 
 try:
     from importlib.metadata import PackageNotFoundError, version as _pkg_version
@@ -19,8 +26,12 @@ __all__ = [
     "NodeArg",
     "OrtValue",
     "RknnProviderOptions",
+    "Rknpu2ProviderOptions",
+    "Rknpu3ProviderOptions",
     "SessionIOBinding",
     "make_provider_options",
+    "make_rknpu2_provider_options",
+    "make_rknpu3_provider_options",
 ]
 
 
