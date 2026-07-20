@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.18)
+project(ztu_somemodelruntime_rknn_consumer LANGUAGES CXX)
+
+find_package(ztu_somemodelruntime_rknn CONFIG REQUIRED)
+add_executable(ztu_somemodelruntime_rknn_consumer ../cpp_api_test.cpp)
+target_compile_features(ztu_somemodelruntime_rknn_consumer PRIVATE cxx_std_17)
+target_link_libraries(ztu_somemodelruntime_rknn_consumer PRIVATE ztu::somemodelruntime_rknn)

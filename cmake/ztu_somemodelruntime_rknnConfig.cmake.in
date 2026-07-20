@@ -1,0 +1,4 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/ztu_somemodelruntime_rknnTargets.cmake")
+check_required_components(ztu_somemodelruntime_rknn)

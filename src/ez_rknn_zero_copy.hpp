@@ -33,6 +33,7 @@ struct dma_heap_allocation_data {
 #endif
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -43,12 +44,8 @@ struct dma_heap_allocation_data {
 #include <utility>
 #include <vector>
 
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-
 namespace ztu {
 namespace rk {
-namespace py = pybind11;
 
 class ZeroCopyEzRknn;
 class RknnIoBinding;
@@ -75,33 +72,6 @@ inline size_t rknn_tensor_type_size(rknn_tensor_type type) {
     return sizeof(int64_t);
   case RKNN_TENSOR_BOOL:
     return sizeof(bool);
-  default:
-    throw std::runtime_error("Unsupported RKNN tensor type");
-  }
-}
-
-inline py::dtype rknn_tensor_type_to_numpy_dtype(rknn_tensor_type type) {
-  switch (type) {
-  case RKNN_TENSOR_FLOAT32:
-    return py::dtype::of<float>();
-  case RKNN_TENSOR_FLOAT16:
-    return py::dtype("float16");
-  case RKNN_TENSOR_INT8:
-    return py::dtype::of<int8_t>();
-  case RKNN_TENSOR_UINT8:
-    return py::dtype::of<uint8_t>();
-  case RKNN_TENSOR_INT16:
-    return py::dtype::of<int16_t>();
-  case RKNN_TENSOR_UINT16:
-    return py::dtype::of<uint16_t>();
-  case RKNN_TENSOR_INT32:
-    return py::dtype::of<int32_t>();
-  case RKNN_TENSOR_UINT32:
-    return py::dtype::of<uint32_t>();
-  case RKNN_TENSOR_INT64:
-    return py::dtype::of<int64_t>();
-  case RKNN_TENSOR_BOOL:
-    return py::dtype::of<bool>();
   default:
     throw std::runtime_error("Unsupported RKNN tensor type");
   }
@@ -136,15 +106,6 @@ inline void require_shape_matches(const std::vector<int64_t> &actual,
                              shape_to_string(expected) + ", got " +
                              shape_to_string(actual));
   }
-}
-
-inline std::vector<int64_t> numpy_shape_i64(const py::array &array) {
-  std::vector<int64_t> shape;
-  shape.reserve(array.ndim());
-  for (ssize_t i = 0; i < array.ndim(); ++i) {
-    shape.push_back(static_cast<int64_t>(array.shape(i)));
-  }
-  return shape;
 }
 
 inline std::string rknn_tensor_type_name(rknn_tensor_type type) {
@@ -424,8 +385,10 @@ inline void require_dense_native_copy_supported(const rknn_tensor_attr &attr,
 
 struct RknnContextHolder {
   explicit RknnContextHolder(rknn_context context, bool owns_context = true,
-                             std::shared_ptr<void> owner = nullptr)
-      : ctx(context), owns_context(owns_context), owner(std::move(owner)) {}
+                             std::shared_ptr<void> owner = nullptr,
+                             std::shared_ptr<std::mutex> run_mutex = nullptr)
+      : ctx(context), owns_context(owns_context), owner(std::move(owner)),
+        run_mutex(std::move(run_mutex)) {}
   RknnContextHolder(const RknnContextHolder &) = delete;
   RknnContextHolder &operator=(const RknnContextHolder &) = delete;
   ~RknnContextHolder() {
@@ -438,6 +401,7 @@ struct RknnContextHolder {
   rknn_context ctx = 0;
   bool owns_context = true;
   std::shared_ptr<void> owner;
+  std::shared_ptr<std::mutex> run_mutex;
 };
 
 class SharedDmaBuffer {
@@ -543,6 +507,23 @@ private:
   bool owns_mapping_ = false;
 };
 
+struct RknnMemoryInfo {
+  std::string device_type;
+  int device_id = 0;
+  size_t size = 0;
+  int fd = -1;
+  int32_t offset = 0;
+  uintptr_t virt_addr = 0;
+  size_t import_count = 0;
+  bool dmabuf_backed = false;
+  uint32_t attr_size = 0;
+  uint32_t size_with_stride = 0;
+  uint32_t w_stride = 0;
+  uint32_t h_stride = 0;
+  int fmt = 0;
+  bool pass_through = false;
+};
+
 class RknnOrtValue {
 public:
   RknnOrtValue() = default;
@@ -561,19 +542,38 @@ public:
     }
   }
 
-  static std::shared_ptr<RknnOrtValue> from_cpu_array(py::array array) {
+  static std::shared_ptr<RknnOrtValue>
+  from_cpu_buffer(void *data, size_t bytes, std::vector<int64_t> shape,
+                  rknn_tensor_type type,
+                  std::shared_ptr<void> owner = nullptr) {
+    if (data == nullptr && bytes != 0) {
+      throw std::runtime_error("CPU tensor data is null");
+    }
     auto value = std::shared_ptr<RknnOrtValue>(new RknnOrtValue());
     value->device_type_ = "cpu";
-    value->cpu_array_ = py::array::ensure(array, py::array::c_style);
-    if (!value->cpu_array_) {
-      throw std::runtime_error("Input must be a contiguous numpy array");
-    }
-    value->shape_.reserve(value->cpu_array_.ndim());
-    for (ssize_t i = 0; i < value->cpu_array_.ndim(); ++i) {
-      value->shape_.push_back(static_cast<int64_t>(value->cpu_array_.shape(i)));
-    }
-    value->type_ = RKNN_TENSOR_TYPE_MAX;
+    value->cpu_data_ = data;
+    value->cpu_bytes_ = bytes;
+    value->cpu_owner_ = std::move(owner);
+    value->shape_ = std::move(shape);
+    value->type_ = type;
     return value;
+  }
+
+  static std::shared_ptr<RknnOrtValue>
+  allocate_cpu(std::vector<int64_t> shape, rknn_tensor_type type) {
+    size_t elements = 1;
+    for (int64_t dim : shape) {
+      if (dim < 0) {
+        throw std::runtime_error("shape dims must be >= 0");
+      }
+      elements *= static_cast<size_t>(dim);
+    }
+    const size_t bytes = elements * rknn_tensor_type_size(type);
+    auto storage = std::shared_ptr<uint8_t[]>(new uint8_t[bytes](),
+                                               std::default_delete<uint8_t[]>());
+    std::shared_ptr<void> owner(storage, storage.get());
+    return from_cpu_buffer(storage.get(), bytes, std::move(shape), type,
+                           std::move(owner));
   }
 
   static std::shared_ptr<RknnOrtValue>
@@ -689,18 +689,10 @@ public:
     type_ = logical_attr.type;
   }
 
-  void require_update_source_compatible(const py::array &source) const {
-    require_shape_matches(numpy_shape_i64(source), shape_,
-                          "update_inplace source");
-    py::dtype expected_dtype = rknn_tensor_type_to_numpy_dtype(type_);
-    py::object dtype_matches =
-        source.attr("dtype").attr("__eq__")(expected_dtype);
-    if (!py::cast<bool>(dtype_matches)) {
-      throw std::runtime_error(
-          "update_inplace source element type mismatch: expected " +
-          std::string(py::str(expected_dtype)) + ", got " +
-          std::string(py::str(source.attr("dtype"))));
-    }
+  void require_update_source_compatible(const std::vector<int64_t> &shape,
+                                        rknn_tensor_type type) const {
+    require_shape_matches(shape, shape_, "update_inplace source");
+    require_type_matches(type, type_, "update_inplace source");
   }
 
   void require_buffer_size_for_attr(const rknn_tensor_attr &native_attr) const {
@@ -720,7 +712,7 @@ public:
 
   uintptr_t data_ptr() const {
     if (is_cpu()) {
-      return reinterpret_cast<uintptr_t>(cpu_array_.data());
+      return reinterpret_cast<uintptr_t>(cpu_data_);
     }
     void *ptr = mutable_data_ptr();
     if (ptr == nullptr) {
@@ -817,61 +809,61 @@ public:
     last_writer_ = std::move(holder);
   }
 
-  void update_inplace(py::array source) {
+  void update_inplace(const void *source, size_t source_bytes,
+                      const std::vector<int64_t> &source_shape,
+                      rknn_tensor_type source_type) {
+    if (source == nullptr && source_bytes != 0) {
+      throw std::runtime_error("source data is null");
+    }
+    require_update_source_compatible(source_shape, source_type);
     if (is_cpu()) {
-      py::array contiguous = py::array::ensure(source, py::array::c_style);
-      if (!contiguous) {
-        throw std::runtime_error("source must be a contiguous numpy array");
-      }
-      require_shape_matches(numpy_shape_i64(contiguous), shape_,
-                            "update_inplace source");
-      py::object dtype_matches =
-          contiguous.attr("dtype").attr("__eq__")(cpu_array_.attr("dtype"));
-      if (!py::cast<bool>(dtype_matches)) {
-        throw std::runtime_error(
-            "update_inplace source element type mismatch: expected " +
-            std::string(py::str(cpu_array_.attr("dtype"))) + ", got " +
-            std::string(py::str(contiguous.attr("dtype"))));
-      }
-      if (contiguous.nbytes() != cpu_array_.nbytes()) {
+      if (source_bytes != cpu_bytes_) {
         throw std::runtime_error("source byte size does not match OrtValue");
       }
-      std::memcpy(cpu_array_.mutable_data(), contiguous.data(),
-                  static_cast<size_t>(contiguous.nbytes()));
+      std::memcpy(cpu_data_, source, source_bytes);
       return;
     }
     void *dst_ptr = mutable_data_ptr();
     if (!is_rknn() || dst_ptr == nullptr) {
       throw std::runtime_error("OrtValue has no RKNN memory");
     }
-    py::array contiguous = py::array::ensure(source, py::array::c_style);
-    if (!contiguous) {
-      throw std::runtime_error("source must be a contiguous numpy array");
-    }
-    require_update_source_compatible(contiguous);
-    const size_t source_bytes = static_cast<size_t>(contiguous.nbytes());
     const size_t dense = attr_dense_bytes(attr_);
     const size_t alloc = attr_alloc_bytes(attr_);
     if (logical_shape_is_native_nhwc() &&
-        should_copy_nhwc_to_nhwc(contiguous)) {
-      copy_nhwc_to_nhwc(contiguous);
-    } else if (should_transpose_nchw_to_nhwc(contiguous)) {
-      copy_nchw_to_nhwc(contiguous);
-    } else if (should_copy_nhwc_to_nhwc(contiguous)) {
-      copy_nhwc_to_nhwc(contiguous);
+        should_copy_nhwc_to_nhwc(source_shape)) {
+      copy_nhwc_to_nhwc(source, source_bytes, source_shape);
+    } else if (should_transpose_nchw_to_nhwc(source_shape)) {
+      copy_nchw_to_nhwc(source, source_shape);
+    } else if (should_copy_nhwc_to_nhwc(source_shape)) {
+      copy_nhwc_to_nhwc(source, source_bytes, source_shape);
     } else if (source_bytes == alloc) {
-      std::memcpy(dst_ptr, contiguous.data(), source_bytes);
+      std::memcpy(dst_ptr, source, source_bytes);
     } else if (source_bytes == dense && dense == alloc) {
-      std::memcpy(dst_ptr, contiguous.data(), source_bytes);
+      std::memcpy(dst_ptr, source, source_bytes);
     } else {
       require_dense_native_copy_supported(attr_, "update_inplace");
     }
     sync_to_device();
   }
 
-  py::array numpy() {
+  size_t logical_bytes() const {
+    size_t elements = 1;
+    for (int64_t dim : shape_) {
+      elements *= static_cast<size_t>(dim);
+    }
+    return elements * rknn_tensor_type_size(type_);
+  }
+
+  void copy_to(void *destination, size_t destination_bytes) {
+    if (destination == nullptr && destination_bytes != 0) {
+      throw std::runtime_error("destination data is null");
+    }
+    if (destination_bytes != logical_bytes()) {
+      throw std::runtime_error("destination byte size does not match OrtValue");
+    }
     if (is_cpu()) {
-      return cpu_array_;
+      std::memcpy(destination, cpu_data_, destination_bytes);
+      return;
     }
     void *src_ptr = mutable_data_ptr();
     if (!is_rknn() || src_ptr == nullptr) {
@@ -879,63 +871,61 @@ public:
     }
     require_dense_native_copy_supported(attr_, "numpy");
     sync_from_device();
-    py::dtype dtype = rknn_tensor_type_to_numpy_dtype(type_);
-    py::array out(dtype, shape_);
     if (should_transpose_nhwc_to_nchw()) {
-      copy_nhwc_to_nchw(out);
+      copy_nhwc_to_nchw(destination);
     } else {
-      std::memcpy(out.mutable_data(), src_ptr,
+      std::memcpy(destination, src_ptr,
                   static_cast<size_t>(attr_dense_bytes(attr_)));
     }
-    return out;
   }
 
-  py::dict memory_info() const {
-    py::dict info;
-    info["device_type"] = device_type_;
-    info["device_id"] = 0;
+  RknnMemoryInfo memory_info() const {
+    RknnMemoryInfo info;
+    info.device_type = device_type_;
+    info.device_id = 0;
     if (is_rknn()) {
-      info["size"] = backing_size();
-      info["fd"] = backing_fd();
-      info["offset"] = backing_offset();
-      info["virt_addr"] = reinterpret_cast<uintptr_t>(mutable_data_ptr());
-      info["import_count"] = imports_.size();
-      info["dmabuf_backed"] = static_cast<bool>(buffer_);
-      info["attr_size"] = attr_.size;
-      info["size_with_stride"] = attr_.size_with_stride;
-      info["w_stride"] = attr_.w_stride;
-      info["h_stride"] = attr_.h_stride;
-      info["fmt"] = static_cast<int>(attr_.fmt);
-      info["pass_through"] = static_cast<bool>(attr_.pass_through);
+      info.size = backing_size();
+      info.fd = backing_fd();
+      info.offset = backing_offset();
+      info.virt_addr = reinterpret_cast<uintptr_t>(mutable_data_ptr());
+      info.import_count = imports_.size();
+      info.dmabuf_backed = static_cast<bool>(buffer_);
+      info.attr_size = attr_.size;
+      info.size_with_stride = attr_.size_with_stride;
+      info.w_stride = attr_.w_stride;
+      info.h_stride = attr_.h_stride;
+      info.fmt = static_cast<int>(attr_.fmt);
+      info.pass_through = static_cast<bool>(attr_.pass_through);
+    } else {
+      info.size = cpu_bytes_;
+      info.virt_addr = reinterpret_cast<uintptr_t>(cpu_data_);
     }
     return info;
   }
 
 private:
-  bool should_transpose_nchw_to_nhwc(const py::array &source) const {
+  bool should_transpose_nchw_to_nhwc(
+      const std::vector<int64_t> &source_shape) const {
     if (attr_.fmt != RKNN_TENSOR_NHWC || attr_.n_dims != 4 ||
-        source.ndim() != 4) {
+        source_shape.size() != 4) {
       return false;
     }
-    const ssize_t n = source.shape(0);
-    const ssize_t c = source.shape(1);
-    const ssize_t h = source.shape(2);
-    const ssize_t w = source.shape(3);
-    return n == static_cast<ssize_t>(attr_.dims[0]) &&
-           h == static_cast<ssize_t>(attr_.dims[1]) &&
-           w == static_cast<ssize_t>(attr_.dims[2]) &&
-           c == static_cast<ssize_t>(attr_.dims[3]);
+    return source_shape[0] == static_cast<int64_t>(attr_.dims[0]) &&
+           source_shape[2] == static_cast<int64_t>(attr_.dims[1]) &&
+           source_shape[3] == static_cast<int64_t>(attr_.dims[2]) &&
+           source_shape[1] == static_cast<int64_t>(attr_.dims[3]);
   }
 
-  bool should_copy_nhwc_to_nhwc(const py::array &source) const {
+  bool should_copy_nhwc_to_nhwc(
+      const std::vector<int64_t> &source_shape) const {
     if (attr_.fmt != RKNN_TENSOR_NHWC || attr_.n_dims != 4 ||
-        source.ndim() != 4) {
+        source_shape.size() != 4) {
       return false;
     }
-    return source.shape(0) == static_cast<ssize_t>(attr_.dims[0]) &&
-           source.shape(1) == static_cast<ssize_t>(attr_.dims[1]) &&
-           source.shape(2) == static_cast<ssize_t>(attr_.dims[2]) &&
-           source.shape(3) == static_cast<ssize_t>(attr_.dims[3]);
+    return source_shape[0] == static_cast<int64_t>(attr_.dims[0]) &&
+           source_shape[1] == static_cast<int64_t>(attr_.dims[1]) &&
+           source_shape[2] == static_cast<int64_t>(attr_.dims[2]) &&
+           source_shape[3] == static_cast<int64_t>(attr_.dims[3]);
   }
 
   bool logical_shape_is_native_nhwc() const {
@@ -958,18 +948,19 @@ private:
            shape_[1] == static_cast<int64_t>(attr_.dims[3]);
   }
 
-  void copy_nchw_to_nhwc(const py::array &source) {
+  void copy_nchw_to_nhwc(const void *source,
+                         const std::vector<int64_t> &source_shape) {
     const size_t elem_size = rknn_tensor_type_size(attr_.type);
-    const size_t n = static_cast<size_t>(source.shape(0));
-    const size_t c = static_cast<size_t>(source.shape(1));
-    const size_t h = static_cast<size_t>(source.shape(2));
-    const size_t w = static_cast<size_t>(source.shape(3));
+    const size_t n = static_cast<size_t>(source_shape[0]);
+    const size_t c = static_cast<size_t>(source_shape[1]);
+    const size_t h = static_cast<size_t>(source_shape[2]);
+    const size_t w = static_cast<size_t>(source_shape[3]);
     const size_t h_stride = attr_height_stride(attr_);
     const size_t w_stride = attr_width_stride(attr_);
     if (h_stride < h || w_stride < w) {
       throw std::runtime_error("NCHW to NHWC update_inplace has invalid RKNN stride");
     }
-    const auto *src = static_cast<const uint8_t *>(source.data());
+    const auto *src = static_cast<const uint8_t *>(source);
     auto *dst = static_cast<uint8_t *>(mutable_data_ptr());
     for (size_t ni = 0; ni < n; ++ni) {
       for (size_t hi = 0; hi < h; ++hi) {
@@ -986,21 +977,22 @@ private:
     }
   }
 
-  void copy_nhwc_to_nhwc(const py::array &source) {
+  void copy_nhwc_to_nhwc(const void *source, size_t source_bytes,
+                         const std::vector<int64_t> &source_shape) {
     const size_t elem_size = rknn_tensor_type_size(attr_.type);
-    const size_t n = static_cast<size_t>(source.shape(0));
-    const size_t h = static_cast<size_t>(source.shape(1));
-    const size_t w = static_cast<size_t>(source.shape(2));
-    const size_t c = static_cast<size_t>(source.shape(3));
+    const size_t n = static_cast<size_t>(source_shape[0]);
+    const size_t h = static_cast<size_t>(source_shape[1]);
+    const size_t w = static_cast<size_t>(source_shape[2]);
+    const size_t c = static_cast<size_t>(source_shape[3]);
     const size_t h_stride = attr_height_stride(attr_);
     const size_t w_stride = attr_width_stride(attr_);
     if (h_stride < h || w_stride < w) {
       throw std::runtime_error("NHWC update_inplace has invalid RKNN stride");
     }
-    const auto *src = static_cast<const uint8_t *>(source.data());
+    const auto *src = static_cast<const uint8_t *>(source);
     auto *dst = static_cast<uint8_t *>(mutable_data_ptr());
     if (h_stride == h && w_stride == w) {
-      std::memcpy(dst, src, static_cast<size_t>(source.nbytes()));
+      std::memcpy(dst, src, source_bytes);
       return;
     }
     for (size_t ni = 0; ni < n; ++ni) {
@@ -1015,7 +1007,7 @@ private:
     }
   }
 
-  void copy_nhwc_to_nchw(py::array &destination) {
+  void copy_nhwc_to_nchw(void *destination) {
     const size_t elem_size = rknn_tensor_type_size(attr_.type);
     const size_t n = static_cast<size_t>(shape_[0]);
     const size_t c = static_cast<size_t>(shape_[1]);
@@ -1027,7 +1019,7 @@ private:
       throw std::runtime_error("NHWC to NCHW numpy has invalid RKNN stride");
     }
     const auto *src = static_cast<const uint8_t *>(mutable_data_ptr());
-    auto *dst = static_cast<uint8_t *>(destination.mutable_data());
+    auto *dst = static_cast<uint8_t *>(destination);
     for (size_t ni = 0; ni < n; ++ni) {
       for (size_t ci = 0; ci < c; ++ci) {
         for (size_t hi = 0; hi < h; ++hi) {
@@ -1096,7 +1088,9 @@ private:
   }
 
   std::string device_type_;
-  py::array cpu_array_;
+  void *cpu_data_ = nullptr;
+  size_t cpu_bytes_ = 0;
+  std::shared_ptr<void> cpu_owner_;
   struct ImportedMem {
     std::shared_ptr<RknnContextHolder> holder;
     rknn_tensor_mem *mem = nullptr;
@@ -1412,11 +1406,18 @@ public:
     }
   }
 
-  void bind_cpu_input(const std::string &name, py::array array) {
+  void bind_cpu_input(const std::string &name,
+                      std::shared_ptr<RknnOrtValue> cpu_value) {
+    if (!cpu_value || !cpu_value->is_cpu()) {
+      throw std::runtime_error("bind_cpu_input requires a CPU OrtValue");
+    }
     auto value =
         session_->create_value_for_io(name, "input", RKNN_TENSOR_TYPE_MAX,
                                       RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
-    value->update_inplace(array);
+    value->update_inplace(
+        reinterpret_cast<const void *>(cpu_value->data_ptr()),
+        cpu_value->logical_bytes(), cpu_value->shape(),
+        cpu_value->element_type());
     bind_ortvalue_input(name, value);
   }
 
@@ -1480,14 +1481,19 @@ public:
     return outputs;
   }
 
-  py::list copy_outputs_to_cpu() {
-    py::list result;
+  std::vector<std::shared_ptr<RknnOrtValue>> copy_outputs_to_cpu() {
+    std::vector<std::shared_ptr<RknnOrtValue>> result;
+    result.reserve(output_order_.size());
     for (size_t idx : output_order_) {
       auto it = bound_outputs_.find(idx);
       if (it == bound_outputs_.end()) {
         continue;
       }
-      result.append(it->second->numpy());
+      auto cpu = RknnOrtValue::allocate_cpu(it->second->shape(),
+                                            it->second->element_type());
+      it->second->copy_to(reinterpret_cast<void *>(cpu->data_ptr()),
+                          cpu->logical_bytes());
+      result.push_back(std::move(cpu));
     }
     return result;
   }
@@ -1542,6 +1548,10 @@ inline void ZeroCopyEzRknn::run_with_iobinding(RknnIoBinding &binding) {
                              "run_with_iobinding");
   }
 
+  std::unique_lock<std::mutex> context_lock;
+  if (holder_->run_mutex) {
+    context_lock = std::unique_lock<std::mutex>(*holder_->run_mutex);
+  }
   const size_t task_id = task_counter_++;
   PerfStats perf_stats;
   {

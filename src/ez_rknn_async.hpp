@@ -70,14 +70,13 @@
 #define ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT 0
 #endif
 
-extern void emit_python_user_warning(const std::string &message);
-
 namespace ztu {
 namespace rk {
 // 异步推理类，基于回调函数返回推理结果
 // 不再需要 EnableTrace 模板参数
 class AsyncEzRknn {
 public:
+  using WarningHandler = std::function<void(const std::string &)>;
 #if ZTU_EZRKNN_ASYNC_HAS_CUSTOM_OP
   using GetCustomOpFunc = rknn_custom_op *(*)();
 #else
@@ -128,7 +127,8 @@ public:
               std::optional<rknn_core_mask> tpCoreMask = RKNN_NPU_CORE_AUTO,
               bool enablePacing = false, bool disableDupContext = false,
               std::optional<rknn_context> sharedWeightMasterContext =
-                  std::nullopt)
+                  std::nullopt,
+              WarningHandler warningHandler = {})
       : model_path_(model_path), layout_(layout), maxQueueSize_(maxQueueSize),
         threadsPerCore_(threadsPerCore), stopFlag(false), taskCounter(0),
         sequentialCallbacks_(sequentialCallbacks), nextSequentialTask(0),
@@ -138,7 +138,8 @@ public:
         disableDupContext_(disableDupContext),
         sharedWeightMasterContext_(sharedWeightMasterContext),
         enablePacing_(enablePacing),
-        printPerf_(read_perf_env_enabled()) {
+        printPerf_(read_perf_env_enabled()),
+        warningHandler_(std::move(warningHandler)) {
     // 使用 Tracy 标记构造函数
 #ifdef TRACY_ENABLE
     ZoneScopedN("AsyncEzRknn::Constructor");
@@ -155,6 +156,38 @@ public:
     init(); // 加载模型、创建初始上下文并查询输入输出属性，创建工作线程（每个线程拥有独立的
             // RKNN 上下文）
     // 启动专门用于调用回调函数的线程
+    callbackThread = std::thread(&AsyncEzRknn::callbackThreadFunc, this);
+  }
+
+  AsyncEzRknn(std::vector<uint8_t> model_data,
+              Layout layout = Layout::NCHW, size_t maxQueueSize = 3,
+              int threadsPerCore = 2, bool sequentialCallbacks = true,
+              std::optional<std::vector<uint64_t>> schedule = std::nullopt,
+              std::optional<rknn_core_mask> tpCoreMask = RKNN_NPU_CORE_AUTO,
+              bool enablePacing = false, bool disableDupContext = false,
+              std::optional<rknn_context> sharedWeightMasterContext =
+                  std::nullopt,
+              WarningHandler warningHandler = {})
+      : model_data_(std::move(model_data)), layout_(layout),
+        maxQueueSize_(maxQueueSize), threadsPerCore_(threadsPerCore),
+        stopFlag(false), taskCounter(0),
+        sequentialCallbacks_(sequentialCallbacks), nextSequentialTask(0),
+        schedule_(schedule.value_or(std::vector<uint64_t>{0})),
+        useScheduleMask_(schedule.has_value()),
+        tpCoreMask_(tpCoreMask.value_or(RKNN_NPU_CORE_AUTO)),
+        disableDupContext_(disableDupContext),
+        sharedWeightMasterContext_(sharedWeightMasterContext),
+        enablePacing_(enablePacing), printPerf_(read_perf_env_enabled()),
+        warningHandler_(std::move(warningHandler)) {
+    if (model_data_.empty()) {
+      throw std::runtime_error("Model data must not be empty");
+    }
+    if (enablePacing_) {
+      std::set<uint64_t> used_cores(schedule_.begin(), schedule_.end());
+      num_cores_ = used_cores.size();
+      last_accepted_time_ = std::chrono::high_resolution_clock::now();
+    }
+    init();
     callbackThread = std::thread(&AsyncEzRknn::callbackThreadFunc, this);
   }
 
@@ -201,7 +234,7 @@ public:
     if (error != NULL || plugin_lib == nullptr) {
       const std::string message = "dlopen " + so_path.string() +
                                   " fail: " + (error ? std::string(error) : "");
-      emit_python_user_warning(
+      emit_warning(
           message +
           " (this could lead to a crash due to internal bugs of rknnrt)");
       throw std::runtime_error(message);
@@ -233,14 +266,13 @@ public:
 #elif defined(__linux__)
     plugin_dir = "/usr/lib/rknpu/op_plugins/";
 #else
-    emit_python_user_warning(
+    emit_warning(
         "Default custom op path is not defined for this OS.");
     return;
 #endif
 
     if (!std::filesystem::exists(plugin_dir)) {
-      emit_python_user_warning("Default plugin directory does not exist: " +
-                               plugin_dir);
+      emit_warning("Default plugin directory does not exist: " + plugin_dir);
       return;
     }
 
@@ -253,8 +285,8 @@ public:
           try {
             load_custom_op(entry.path());
           } catch (const std::runtime_error &e) {
-            emit_python_user_warning("Failed to load plugin " + filename +
-                                     ": " + e.what());
+            emit_warning("Failed to load plugin " + filename + ": " +
+                         e.what());
           }
         }
       }
@@ -274,7 +306,7 @@ public:
   }
 
   void load_custom_ops_from_default_path() {
-    emit_python_user_warning(kCustomOpDisabledMsg);
+    emit_warning(kCustomOpDisabledMsg);
   }
 
   void register_loaded_custom_ops() {
@@ -642,6 +674,12 @@ public:
     return sdk_version_warning_;
   }
   const std::string &custom_string() const { return custom_string_; }
+  std::shared_ptr<std::mutex> context_mutex(size_t index) const {
+    if (index >= contextMutexes_.size()) {
+      throw std::out_of_range("RKNN context mutex index out of range");
+    }
+    return contextMutexes_[index];
+  }
   std::vector<rknn_tensor_attr> takeTaskOutputAttrs(size_t taskId) {
     std::lock_guard<std::mutex> lock(taskOutputAttrsMutex_);
     auto it = taskOutputAttrs_.find(taskId);
@@ -654,6 +692,15 @@ public:
   }
 
 private:
+  void emit_warning(const std::string &message) const {
+    if (warningHandler_) {
+      warningHandler_(message);
+    } else {
+      std::cerr << "[ztu_somemodelruntime_rknn] warning: " << message
+                << std::endl;
+    }
+  }
+
   struct PerfStats {
     long long set_input_us = 0;
     long long infer_us = 0;
@@ -663,6 +710,7 @@ private:
   // Pacing / Smoothing members
   bool enablePacing_ = false;
   bool printPerf_ = false;
+  WarningHandler warningHandler_;
   std::atomic<float> avg_proc_time_us_{0.0f};
   std::chrono::high_resolution_clock::time_point last_accepted_time_;
   std::mutex pacer_mutex_;
@@ -704,6 +752,7 @@ private:
 
   // 线程池及任务队列
   std::vector<std::thread> workerThreads;
+  std::vector<std::shared_ptr<std::mutex>> contextMutexes_;
   std::queue<Task> taskQueue;
   std::mutex queueMutex;
   std::condition_variable queueCond;
@@ -898,17 +947,20 @@ private:
 #ifdef TRACY_ENABLE
     ZoneScopedN("AsyncEzRknn::init");
 #endif
-    std::ifstream file(model_path_, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-      throw std::runtime_error("Failed to open model file: " +
-                               model_path_.string());
+    if (model_data_.empty()) {
+      std::ifstream file(model_path_, std::ios::binary | std::ios::ate);
+      if (!file.is_open()) {
+        throw std::runtime_error("Failed to open model file: " +
+                                 model_path_.string());
+      }
+      const size_t model_size = static_cast<size_t>(file.tellg());
+      file.seekg(0, std::ios::beg);
+      model_data_.resize(model_size);
+      if (!file.read(reinterpret_cast<char *>(model_data_.data()), model_size)) {
+        throw std::runtime_error("Failed to read model file");
+      }
     }
-    size_t model_size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    std::vector<uint8_t> model_data(model_size);
-    if (!file.read(reinterpret_cast<char *>(model_data.data()), model_size)) {
-      throw std::runtime_error("Failed to read model file");
-    }
+    const size_t model_size = model_data_.size();
     const bool use_shared_weight = sharedWeightMasterContext_.has_value();
     rknn_init_extend init_extend;
     std::memset(&init_extend, 0, sizeof(init_extend));
@@ -919,7 +971,7 @@ private:
       init_flags = RKNN_FLAG_SHARE_WEIGHT_MEM;
       init_extend_ptr = &init_extend;
     }
-    int ret = rknn_init(&initial_ctx, model_data.data(), model_size,
+    int ret = rknn_init(&initial_ctx, model_data_.data(), model_size,
                         init_flags, init_extend_ptr);
     if (ret < 0) {
       throw std::runtime_error(format_rknn_error("rknn_init", ret));
@@ -988,6 +1040,10 @@ private:
 
     int totalThreads = threadsPerCore_ * static_cast<int>(worker_routes.size());
     contexts.resize(totalThreads);
+    contextMutexes_.reserve(static_cast<size_t>(totalThreads));
+    for (int i = 0; i < totalThreads; ++i) {
+      contextMutexes_.push_back(std::make_shared<std::mutex>());
+    }
     contexts[0] = initial_ctx;
     for (int i = 1; i < totalThreads; i++) {
       bool disable_dup_context = false;
@@ -1008,7 +1064,7 @@ private:
           init_flags = RKNN_FLAG_SHARE_WEIGHT_MEM;
           init_extend_ptr = &init_extend;
         }
-        int ret = rknn_init(&contexts[i], model_data.data(), model_size,
+        int ret = rknn_init(&contexts[i], model_data_.data(), model_size,
                             init_flags, init_extend_ptr);
         if (ret < 0) {
           throw std::runtime_error(format_rknn_error("rknn_init", ret));
@@ -1229,6 +1285,8 @@ private:
         ZoneText(taskArgs.c_str(), taskArgs.length());
 #endif
         rknn_context ctx = contexts[threadId];
+        std::unique_lock<std::mutex> contextLock(
+            *contextMutexes_.at(static_cast<size_t>(threadId)));
         PerfStats perfStats;
 
         // 1. 构造并准备输入数据
@@ -1568,7 +1626,7 @@ private:
 
     // 检查是否需要警告：使用 dup_context 且总线程数大于 1
     if (is_dup_context_enabled() && contexts.size() > 1) {
-      emit_python_user_warning(
+      emit_warning(
           "Registering custom ops with dup_context and "
           "multiple threads (>1) may cause issues due to RKNN internal "
           "bugs. Consider defining ZTU_EZRKNN_ASYNC_DISABLE_DUP_CONTEXT "

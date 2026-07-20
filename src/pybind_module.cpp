@@ -1,1386 +1,762 @@
-#include <iostream>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <ztu/somemodelruntime_rknn.hpp>
+
+#include "rknn_api.h"
+
+#include <algorithm>
 #include <cctype>
-#include <chrono>
 #include <cstring>
-#include <array>
-#include <future>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <queue>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
-#include "ez_rknn_async.hpp"
-#include "ez_rknn_zero_copy.hpp"
-
 namespace py = pybind11;
+namespace smr = ztu::somemodelruntime::rknn;
 
-void emit_python_user_warning(const std::string &message) {
+namespace {
+
+void emit_python_warning(std::string_view message) {
+  py::gil_scoped_acquire gil;
   py::module_ warnings = py::module_::import("warnings");
   py::object user_warning = py::module_::import("builtins").attr("UserWarning");
   warnings.attr("warn")(py::str(message), user_warning, 2);
 }
 
-namespace {
-
-constexpr int64_t kDefaultSubmitTimeoutMs = 10000;
-using ztu::rk::AsyncEzRknn;
-using ztu::rk::RknnIoBinding;
-using ztu::rk::RknnContextHolder;
-using ztu::rk::RknnOrtValue;
-using ztu::rk::ZeroCopyEzRknn;
-using ztu::rk::ZeroCopyInputLayout;
-using ztu::rk::ZeroCopyLayoutMode;
-using ztu::rk::attr_shape_i64;
-using ztu::rk::require_shape_matches;
-using ztu::rk::shape_to_string;
-using ztu::rk::rknn_tensor_type_to_numpy_dtype;
-
-struct ParsedInput {
-  py::array array;
-  rknn_tensor_type type;
-  size_t bytes;
-  const void *data;
-  uint32_t n_dims;
-  std::array<uint32_t, RKNN_MAX_DIMS> dims;
-};
-
-struct PendingResult {
-  std::future<std::pair<AsyncEzRknn::InferenceResponse,
-                        std::vector<rknn_tensor_attr>>>
-      future;
-};
-
-struct NodeArgInfo {
-  std::string name;
-  std::vector<int64_t> shape;
-  std::string type;
-};
-
-struct ModelMetadataInfo {
-  std::map<std::string, std::string> custom_metadata_map;
-};
-
-struct SessionConfig {
-  std::string layout = "nchw";
-  std::string zero_copy_layout = "nhwc";
-  size_t max_queue_size = 3;
-  int threads_per_core = 1;
-  int64_t submit_timeout_ms = kDefaultSubmitTimeoutMs;
-  bool sequential_callbacks = true;
-  std::optional<std::vector<uint64_t>> schedule;
-  std::optional<rknn_core_mask> tp_core_mask;
-  bool enable_pacing = false;
-  bool disable_dup_context = false;
-  std::vector<std::string> custom_op_paths;
-  bool custom_op_default_path = false;
-};
-
-template <typename T> std::shared_ptr<T> make_py_shared(T obj) {
-  return std::shared_ptr<T>(new T(std::move(obj)), [](T *p) {
-    py::gil_scoped_acquire gil;
-    delete p;
+std::string trim(std::string value) {
+  const auto first = std::find_if_not(value.begin(), value.end(), [](char ch) {
+    return std::isspace(static_cast<unsigned char>(ch));
   });
+  const auto last = std::find_if_not(value.rbegin(), value.rend(), [](char ch) {
+                      return std::isspace(static_cast<unsigned char>(ch));
+                    }).base();
+  if (first >= last)
+    return {};
+  return std::string(first, last);
 }
 
-rknn_tensor_type dtype_to_rknn(const py::dtype &dtype) {
-  if (dtype.is(py::dtype::of<float>())) {
-    return RKNN_TENSOR_FLOAT32;
+int64_t parse_int(py::handle value, const char *name) {
+  if (py::isinstance<py::int_>(value))
+    return py::cast<int64_t>(value);
+  if (py::isinstance<py::str>(value)) {
+    std::string text = trim(py::cast<std::string>(value));
+    size_t used = 0;
+    try {
+      const long long result = std::stoll(text, &used);
+      if (used == text.size())
+        return static_cast<int64_t>(result);
+    } catch (...) {
+    }
   }
-  if (dtype.is(py::dtype("float16"))) {
-    return RKNN_TENSOR_FLOAT16;
-  }
-  if (dtype.is(py::dtype::of<int8_t>())) {
-    return RKNN_TENSOR_INT8;
-  }
-  if (dtype.is(py::dtype::of<uint8_t>())) {
-    return RKNN_TENSOR_UINT8;
-  }
-  if (dtype.is(py::dtype::of<int16_t>())) {
-    return RKNN_TENSOR_INT16;
-  }
-  if (dtype.is(py::dtype::of<uint16_t>())) {
-    return RKNN_TENSOR_UINT16;
-  }
-  if (dtype.is(py::dtype::of<int32_t>())) {
-    return RKNN_TENSOR_INT32;
-  }
-  if (dtype.is(py::dtype::of<uint32_t>())) {
-    return RKNN_TENSOR_UINT32;
-  }
-  if (dtype.is(py::dtype::of<int64_t>())) {
-    return RKNN_TENSOR_INT64;
-  }
-  if (dtype.is(py::dtype::of<bool>())) {
-    return RKNN_TENSOR_BOOL;
-  }
-  throw std::runtime_error("Unsupported numpy dtype for RKNN input");
+  throw std::runtime_error(std::string(name) + " must be an integer");
 }
 
-std::string rknn_type_to_onnx_str(rknn_tensor_type type) {
+bool parse_bool(py::handle value, const char *name) {
+  if (py::isinstance<py::bool_>(value))
+    return py::cast<bool>(value);
+  if (py::isinstance<py::int_>(value))
+    return py::cast<int64_t>(value) != 0;
+  if (py::isinstance<py::str>(value)) {
+    std::string text = trim(py::cast<std::string>(value));
+    std::transform(text.begin(), text.end(), text.begin(), [](char ch) {
+      return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    });
+    if (text == "1" || text == "true" || text == "on" || text == "yes")
+      return true;
+    if (text == "0" || text == "false" || text == "off" || text == "no")
+      return false;
+  }
+  throw std::runtime_error(std::string(name) + " must be a boolean");
+}
+
+std::vector<int64_t> parse_shape(py::handle value, bool allow_none = false) {
+  if (allow_none && value.is_none())
+    return {};
+  if (!py::isinstance<py::sequence>(value))
+    throw std::runtime_error("shape must be a sequence of integers");
+  std::vector<int64_t> result;
+  for (py::handle item : value.cast<py::sequence>()) {
+    const int64_t dim = parse_int(item, "shape dim");
+    if (dim < 0)
+      throw std::runtime_error("shape dims must be >= 0");
+    result.push_back(dim);
+  }
+  return result;
+}
+
+std::vector<int64_t> array_shape(const py::array &array) {
+  std::vector<int64_t> result;
+  result.reserve(static_cast<size_t>(array.ndim()));
+  for (ssize_t i = 0; i < array.ndim(); ++i)
+    result.push_back(static_cast<int64_t>(array.shape(i)));
+  return result;
+}
+
+smr::TensorElementType dtype_to_element(const py::dtype &dtype) {
+  if (dtype.is(py::dtype::of<float>()))
+    return smr::TensorElementType::Float32;
+  if (dtype.is(py::dtype("float16")))
+    return smr::TensorElementType::Float16;
+  if (dtype.is(py::dtype::of<int8_t>()))
+    return smr::TensorElementType::Int8;
+  if (dtype.is(py::dtype::of<uint8_t>()))
+    return smr::TensorElementType::Uint8;
+  if (dtype.is(py::dtype::of<int16_t>()))
+    return smr::TensorElementType::Int16;
+  if (dtype.is(py::dtype::of<uint16_t>()))
+    return smr::TensorElementType::Uint16;
+  if (dtype.is(py::dtype::of<int32_t>()))
+    return smr::TensorElementType::Int32;
+  if (dtype.is(py::dtype::of<uint32_t>()))
+    return smr::TensorElementType::Uint32;
+  if (dtype.is(py::dtype::of<int64_t>()))
+    return smr::TensorElementType::Int64;
+  if (dtype.is(py::dtype::of<bool>()))
+    return smr::TensorElementType::Bool;
+  throw std::runtime_error("Unsupported numpy dtype for RKNN tensor");
+}
+
+py::dtype element_to_dtype(smr::TensorElementType type) {
   switch (type) {
-  case RKNN_TENSOR_FLOAT32:
+  case smr::TensorElementType::Float32:
+    return py::dtype::of<float>();
+  case smr::TensorElementType::Float16:
+    return py::dtype("float16");
+  case smr::TensorElementType::Int8:
+    return py::dtype::of<int8_t>();
+  case smr::TensorElementType::Uint8:
+    return py::dtype::of<uint8_t>();
+  case smr::TensorElementType::Int16:
+    return py::dtype::of<int16_t>();
+  case smr::TensorElementType::Uint16:
+    return py::dtype::of<uint16_t>();
+  case smr::TensorElementType::Int32:
+    return py::dtype::of<int32_t>();
+  case smr::TensorElementType::Uint32:
+    return py::dtype::of<uint32_t>();
+  case smr::TensorElementType::Int64:
+    return py::dtype::of<int64_t>();
+  case smr::TensorElementType::Bool:
+    return py::dtype::of<bool>();
+  default:
+    throw std::runtime_error("Unsupported RKNN tensor type");
+  }
+}
+
+std::string element_to_onnx_string(smr::TensorElementType type) {
+  switch (type) {
+  case smr::TensorElementType::Float32:
     return "tensor(float)";
-  case RKNN_TENSOR_FLOAT16:
+  case smr::TensorElementType::Float16:
     return "tensor(float16)";
-  case RKNN_TENSOR_INT8:
+  case smr::TensorElementType::Int8:
     return "tensor(int8)";
-  case RKNN_TENSOR_UINT8:
+  case smr::TensorElementType::Uint8:
     return "tensor(uint8)";
-  case RKNN_TENSOR_INT16:
+  case smr::TensorElementType::Int16:
     return "tensor(int16)";
-  case RKNN_TENSOR_UINT16:
+  case smr::TensorElementType::Uint16:
     return "tensor(uint16)";
-  case RKNN_TENSOR_INT32:
+  case smr::TensorElementType::Int32:
     return "tensor(int32)";
-  case RKNN_TENSOR_UINT32:
+  case smr::TensorElementType::Uint32:
     return "tensor(uint32)";
-  case RKNN_TENSOR_INT64:
+  case smr::TensorElementType::Int64:
     return "tensor(int64)";
-  case RKNN_TENSOR_BOOL:
+  case smr::TensorElementType::Bool:
     return "tensor(bool)";
   default:
     return "tensor(unknown)";
   }
 }
 
-std::string trim_string(const std::string &input) {
-  size_t start = 0;
-  while (start < input.size() &&
-         std::isspace(static_cast<unsigned char>(input[start]))) {
-    ++start;
-  }
-  size_t end = input.size();
-  while (end > start &&
-         std::isspace(static_cast<unsigned char>(input[end - 1]))) {
-    --end;
-  }
-  return input.substr(start, end - start);
+smr::TensorElementType dtype_like_to_element(py::handle value,
+                                             bool allow_none = false) {
+  if (allow_none && value.is_none())
+    return smr::TensorElementType::Unknown;
+  return dtype_to_element(
+      py::dtype::from_args(py::reinterpret_borrow<py::object>(value)));
 }
 
-int64_t parse_int_like(py::handle value, const char *name) {
-  if (py::isinstance<py::int_>(value)) {
-    return py::cast<int64_t>(value);
-  }
-  if (py::isinstance<py::str>(value)) {
-    std::string text = trim_string(py::cast<std::string>(value));
-    size_t idx = 0;
-    long long parsed = 0;
-    try {
-      parsed = std::stoll(text, &idx);
-    } catch (...) {
-      throw std::runtime_error(std::string(name) + " must be an integer");
-    }
-    if (idx != text.size()) {
-      throw std::runtime_error(std::string(name) + " must be an integer");
-    }
-    return static_cast<int64_t>(parsed);
-  }
-  throw std::runtime_error(std::string(name) + " must be an integer");
-}
-
-bool parse_bool_like(py::handle value, const char *name) {
-  if (py::isinstance<py::bool_>(value)) {
-    return py::cast<bool>(value);
-  }
-  if (py::isinstance<py::int_>(value)) {
-    return py::cast<int64_t>(value) != 0;
-  }
-  if (py::isinstance<py::str>(value)) {
-    std::string text = trim_string(py::cast<std::string>(value));
-    for (auto &c : text) {
-      c = static_cast<char>(::tolower(c));
-    }
-    if (text == "1" || text == "true" || text == "on" || text == "yes") {
-      return true;
-    }
-    if (text == "0" || text == "false" || text == "off" || text == "no") {
-      return false;
-    }
-  }
-  throw std::runtime_error(std::string(name) + " must be a boolean");
-}
-
-rknn_tensor_type dtype_like_to_rknn(py::handle value,
-                                    bool allow_none = false) {
-  if (allow_none && value.is_none()) {
-    return RKNN_TENSOR_TYPE_MAX;
-  }
-  py::dtype dtype =
-      py::dtype::from_args(py::reinterpret_borrow<py::object>(value));
-  return dtype_to_rknn(dtype);
-}
-
-uint64_t parse_mem_flags(py::handle value) {
-  if (value.is_none()) {
+uint64_t parse_memory_flags(py::handle value) {
+  if (value.is_none())
     return RKNN_FLAG_MEMORY_FLAGS_DEFAULT;
-  }
-  if (py::isinstance<py::int_>(value)) {
+  if (py::isinstance<py::int_>(value))
     return static_cast<uint64_t>(py::cast<int64_t>(value));
-  }
-  if (!py::isinstance<py::str>(value)) {
+  if (!py::isinstance<py::str>(value))
     throw std::runtime_error("mem_flags must be a string, integer, or None");
-  }
-  std::string text = trim_string(py::cast<std::string>(value));
-  for (auto &c : text) {
-    c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-  }
-  if (text == "default" || text == "cacheable") {
+  std::string text = trim(py::cast<std::string>(value));
+  std::transform(text.begin(), text.end(), text.begin(), [](char ch) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  });
+  if (text == "default" || text == "cacheable")
     return RKNN_FLAG_MEMORY_FLAGS_DEFAULT;
-  }
   if (text == "non_cacheable" || text == "non-cacheable" ||
-      text == "uncached") {
+      text == "uncached")
     return RKNN_FLAG_MEMORY_NON_CACHEABLE;
-  }
-  if (text == "try_sram" || text == "sram") {
+  if (text == "try_sram" || text == "sram")
     return RKNN_FLAG_MEMORY_TRY_ALLOC_SRAM;
-  }
-  throw std::runtime_error(
-      "mem_flags must be one of: default, cacheable, non_cacheable, try_sram");
+  throw std::runtime_error("invalid mem_flags");
 }
 
-std::vector<int64_t> parse_shape_like(py::handle value, bool allow_none) {
-  if (allow_none && value.is_none()) {
-    return {};
-  }
-  if (!py::isinstance<py::sequence>(value)) {
-    throw std::runtime_error("shape must be a sequence of integers");
-  }
-  py::sequence seq = value.cast<py::sequence>();
-  std::vector<int64_t> shape;
-  shape.reserve(seq.size());
-  for (auto item : seq) {
-    int64_t dim = parse_int_like(item, "shape dim");
-    if (dim < 0) {
-      throw std::runtime_error("shape dims must be >= 0");
-    }
-    shape.push_back(dim);
-  }
-  return shape;
-}
-
-std::vector<uint64_t> parse_schedule_like(py::handle value) {
-  std::vector<uint64_t> schedule;
-  if (py::isinstance<py::int_>(value) || py::isinstance<py::str>(value)) {
-    if (py::isinstance<py::int_>(value)) {
-      int64_t core = parse_int_like(value, "schedule");
-      if (core < 0) {
-        throw std::runtime_error("schedule values must be >= 0");
-      }
-      schedule.push_back(static_cast<uint64_t>(core));
-    } else {
-      std::string text = py::cast<std::string>(value);
-      for (auto &c : text) {
-        if (c == '[' || c == ']' || c == ',') {
-          c = ' ';
-        }
-      }
-      std::stringstream ss(text);
-      std::string token;
-      while (ss >> token) {
-        size_t idx = 0;
-        long long parsed = 0;
-        try {
-          parsed = std::stoll(token, &idx);
-        } catch (...) {
-          throw std::runtime_error("schedule must contain integers");
-        }
-        if (idx != token.size()) {
-          throw std::runtime_error("schedule must contain integers");
-        }
-        if (parsed < 0) {
-          throw std::runtime_error("schedule values must be >= 0");
-        }
-        schedule.push_back(static_cast<uint64_t>(parsed));
-      }
-    }
-  } else if (py::isinstance<py::sequence>(value)) {
-    py::sequence seq = value.cast<py::sequence>();
-    schedule.reserve(seq.size());
-    for (auto item : seq) {
-      int64_t core = parse_int_like(item, "schedule");
-      if (core < 0) {
-        throw std::runtime_error("schedule values must be >= 0");
-      }
-      schedule.push_back(static_cast<uint64_t>(core));
-    }
-  } else {
-    throw std::runtime_error(
-        "schedule must be an integer, string, or sequence");
-  }
-  if (schedule.empty()) {
-    throw std::runtime_error("schedule must not be empty");
-  }
-  return schedule;
-}
-
-rknn_core_mask parse_tp_mode_like(py::handle value) {
-  if (!py::isinstance<py::str>(value)) {
-    throw std::runtime_error("tp_mode must be a string");
-  }
-
-  std::string text = trim_string(py::cast<std::string>(value));
-  for (auto &c : text) {
-    c = static_cast<char>(::tolower(c));
-  }
-
-  if (text == "auto") {
-    return RKNN_NPU_CORE_AUTO;
-  }
-  if (text == "all") {
-    return RKNN_NPU_CORE_ALL;
-  }
-  if (text == "0") {
-    return RKNN_NPU_CORE_0;
-  }
-  if (text == "1") {
-    return RKNN_NPU_CORE_1;
-  }
-  if (text == "2") {
-    return RKNN_NPU_CORE_2;
-  }
-  if (text == "0,1") {
-    return RKNN_NPU_CORE_0_1;
-  }
-  if (text == "0,1,2") {
-    return RKNN_NPU_CORE_0_1_2;
-  }
-
-  throw std::runtime_error(
-      "invalid tp_mode: '" + text +
-      "', expected one of: auto, all, 0, 1, 2, 0,1, 0,1,2");
-}
-
-std::string parse_path_like(py::handle value, const char *name) {
+std::string parse_path(py::handle value, const char *name) {
   try {
-    py::object path_obj = py::module_::import("os").attr("fspath")(value);
-    return py::cast<std::string>(path_obj);
+    return py::cast<std::string>(py::module_::import("os").attr("fspath")(value));
   } catch (...) {
     throw std::runtime_error(std::string(name) +
                              " must be a path-like object or string");
   }
 }
 
-std::vector<std::string> parse_paths_like(py::handle value, const char *name) {
-  if (py::isinstance<py::str>(value) || py::hasattr(value, "__fspath__")) {
-    return {parse_path_like(value, name)};
-  }
-  if (py::isinstance<py::sequence>(value)) {
-    py::sequence seq = value.cast<py::sequence>();
-    std::vector<std::string> paths;
-    paths.reserve(seq.size());
-    for (auto item : seq) {
-      paths.push_back(parse_path_like(item, name));
-    }
-    return paths;
-  }
-  throw std::runtime_error(std::string(name) +
-                           " must be a path-like object or sequence of "
-                           "path-like objects");
+std::vector<std::string> parse_paths(py::handle value, const char *name) {
+  if (py::isinstance<py::str>(value) || py::hasattr(value, "__fspath__"))
+    return {parse_path(value, name)};
+  if (!py::isinstance<py::sequence>(value))
+    throw std::runtime_error(std::string(name) + " must be a path or sequence");
+  std::vector<std::string> result;
+  for (py::handle item : value.cast<py::sequence>())
+    result.push_back(parse_path(item, name));
+  return result;
 }
 
-py::dict extract_provider_options(const py::object &provider_options_obj) {
-  if (provider_options_obj.is_none()) {
-    return py::dict();
-  }
-  if (py::isinstance<py::dict>(provider_options_obj)) {
-    return provider_options_obj.cast<py::dict>();
-  }
-  if (py::isinstance<py::sequence>(provider_options_obj)) {
-    py::sequence seq = provider_options_obj.cast<py::sequence>();
-    if (seq.size() == 0) {
-      return py::dict();
+std::vector<uint64_t> parse_schedule(py::handle value) {
+  std::vector<uint64_t> result;
+  if (py::isinstance<py::int_>(value)) {
+    const int64_t item = parse_int(value, "schedule");
+    if (item < 0)
+      throw std::runtime_error("schedule values must be >= 0");
+    result.push_back(static_cast<uint64_t>(item));
+  } else if (py::isinstance<py::str>(value)) {
+    std::string text = py::cast<std::string>(value);
+    for (char &ch : text)
+      if (ch == ',' || ch == '[' || ch == ']')
+        ch = ' ';
+    std::stringstream stream(text);
+    int64_t item;
+    while (stream >> item) {
+      if (item < 0)
+        throw std::runtime_error("schedule values must be >= 0");
+      result.push_back(static_cast<uint64_t>(item));
     }
-    py::object first = seq[0];
-    if (py::isinstance<py::dict>(first)) {
-      return first.cast<py::dict>();
-    }
-  }
-  throw std::runtime_error("provider_options must be a dict or a sequence "
-                           "whose first element is a dict");
-}
-
-SessionConfig parse_session_config(const py::object &provider_options_obj) {
-  SessionConfig config;
-  py::dict opts = extract_provider_options(provider_options_obj);
-  bool has_schedule = false;
-  bool has_tp_mode = false;
-  for (auto item : opts) {
-    std::string key = py::cast<std::string>(item.first);
-    if (key == "layout") {
-      config.layout = py::cast<std::string>(item.second);
-      continue;
-    }
-    if (key == "zero_copy_layout") {
-      config.zero_copy_layout = py::cast<std::string>(item.second);
-      continue;
-    }
-    if (key == "max_queue_size") {
-      int64_t value = parse_int_like(item.second, "max_queue_size");
-      if (value <= 0) {
-        throw std::runtime_error("max_queue_size must be > 0");
-      }
-      config.max_queue_size = static_cast<size_t>(value);
-      continue;
-    }
-    if (key == "threads_per_core") {
-      int64_t value = parse_int_like(item.second, "threads_per_core");
-      if (value <= 0) {
-        throw std::runtime_error("threads_per_core must be > 0");
-      }
-      config.threads_per_core = static_cast<int>(value);
-      continue;
-    }
-    if (key == "submit_timeout_ms") {
-      int64_t value = parse_int_like(item.second, "submit_timeout_ms");
-      if (value <= 0) {
-        throw std::runtime_error("submit_timeout_ms must be > 0");
-      }
-      config.submit_timeout_ms = value;
-      continue;
-    }
-    if (key == "sequential_callbacks") {
-      config.sequential_callbacks = parse_bool_like(item.second, key.c_str());
-      continue;
-    }
-    if (key == "schedule") {
-      config.schedule = parse_schedule_like(item.second);
-      has_schedule = true;
-      continue;
-    }
-    if (key == "tp_mode") {
-      config.tp_core_mask = parse_tp_mode_like(item.second);
-      has_tp_mode = true;
-      continue;
-    }
-    if (key == "enable_pacing") {
-      config.enable_pacing = parse_bool_like(item.second, key.c_str());
-      continue;
-    }
-    if (key == "disable_dup_context") {
-      config.disable_dup_context = parse_bool_like(item.second, key.c_str());
-      continue;
-    }
-    if (key == "custom_op_path" || key == "custom_op_paths") {
-      auto parsed_paths = parse_paths_like(item.second, key.c_str());
-      config.custom_op_paths.insert(config.custom_op_paths.end(),
-                                    parsed_paths.begin(), parsed_paths.end());
-      continue;
-    }
-    if (key == "custom_op_default_path" ||
-        key == "load_custom_ops_from_default_path") {
-      config.custom_op_default_path = parse_bool_like(item.second, key.c_str());
-      continue;
-    }
-    throw std::runtime_error(
-        "Unknown provider_options key: " + key +
-        ". Supported keys: layout, zero_copy_layout, max_queue_size, threads_per_core, "
-        "submit_timeout_ms, "
-        "sequential_callbacks, schedule, tp_mode, enable_pacing, "
-        "disable_dup_context, custom_op_path, custom_op_paths, "
-        "custom_op_default_path, "
-        "load_custom_ops_from_default_path");
-  }
-  if (has_schedule && has_tp_mode) {
-    throw std::runtime_error(
-        "provider_options 'tp_mode' conflicts with 'schedule'; set only one.");
-  }
-  if (!has_schedule && !has_tp_mode) {
-    config.tp_core_mask = RKNN_NPU_CORE_AUTO;
-  }
-  return config;
-}
-
-std::string resolve_model_path(const py::object &path_or_bytes) {
-  if (py::isinstance<py::bytes>(path_or_bytes)) {
-    throw std::runtime_error("bytes model content is not supported yet; please "
-                             "pass a filesystem path");
-  }
-  py::object os_path = py::module_::import("os").attr("fspath")(path_or_bytes);
-  return py::cast<std::string>(os_path);
-}
-
-std::vector<int64_t> array_shape_i64(const py::array &array) {
-  std::vector<int64_t> shape;
-  shape.reserve(array.ndim());
-  for (ssize_t i = 0; i < array.ndim(); ++i) {
-    shape.push_back(static_cast<int64_t>(array.shape(i)));
-  }
-  return shape;
-}
-
-ParsedInput parse_array(py::array array, const rknn_tensor_attr &expected_attr,
-                        bool allow_batch, const std::string &input_name) {
-  if (!array) {
-    throw std::runtime_error("Input must be a numpy array");
-  }
-  auto dtype = array.dtype();
-  rknn_tensor_type type = dtype_to_rknn(dtype);
-  if (array.ndim() > RKNN_MAX_DIMS) {
-    throw std::runtime_error("Input rank is too large");
-  }
-  const uint32_t expected_dims = expected_attr.n_dims;
-  if (expected_dims > 0 && static_cast<uint32_t>(array.ndim()) != expected_dims) {
-    throw std::runtime_error("Input rank mismatch: expected " +
-                             std::to_string(expected_dims) + ", got " +
-                             std::to_string(array.ndim()));
-  }
-  if (allow_batch && array.ndim() < 1) {
-    throw std::runtime_error("Batch input must have ndim >= 1");
-  }
-  const std::vector<int64_t> actual_shape = array_shape_i64(array);
-  const std::vector<int64_t> expected_shape = attr_shape_i64(expected_attr);
-  if (allow_batch) {
-    for (size_t i = 1; i < expected_shape.size(); ++i) {
-      if (actual_shape[i] != expected_shape[i]) {
-        std::vector<int64_t> batch_expected = expected_shape;
-        batch_expected[0] = actual_shape[0];
-        throw std::runtime_error(
-            "Batch input '" + input_name + "' shape mismatch: expected " +
-            shape_to_string(batch_expected) + ", got " +
-            shape_to_string(actual_shape));
-      }
+  } else if (py::isinstance<py::sequence>(value)) {
+    for (py::handle entry : value.cast<py::sequence>()) {
+      const int64_t item = parse_int(entry, "schedule");
+      if (item < 0)
+        throw std::runtime_error("schedule values must be >= 0");
+      result.push_back(static_cast<uint64_t>(item));
     }
   } else {
-    require_shape_matches(actual_shape, expected_shape,
-                          "Input '" + input_name + "'");
+    throw std::runtime_error("schedule must be an integer, string, or sequence");
   }
-  std::array<uint32_t, RKNN_MAX_DIMS> dims = {};
-  for (ssize_t i = 0; i < array.ndim(); ++i) {
-    const ssize_t dim = array.shape(i);
-    if (dim < 0) {
-      throw std::runtime_error("Input shape contains negative dim");
-    }
-    dims[static_cast<size_t>(i)] = static_cast<uint32_t>(dim);
-  }
-  return ParsedInput{array, type, static_cast<size_t>(array.nbytes()), array.data(),
-                     static_cast<uint32_t>(array.ndim()), dims};
-}
-
-py::array make_output_array(const std::shared_ptr<float[]> &data,
-                            const rknn_tensor_attr &attr) {
-  int ndim = static_cast<int>(attr.n_dims);
-  std::vector<ssize_t> shape;
-  shape.reserve(ndim);
-  for (int i = 0; i < ndim; ++i) {
-    shape.push_back(static_cast<ssize_t>(attr.dims[i]));
-  }
-  std::vector<ssize_t> strides;
-  strides.resize(ndim);
-  ssize_t stride = static_cast<ssize_t>(sizeof(float));
-  for (int i = ndim - 1; i >= 0; --i) {
-    strides[i] = stride;
-    stride *= shape[i];
-  }
-  auto holder = new std::shared_ptr<float[]>(data);
-  py::capsule capsule(holder, [](void *p) {
-    auto *ptr = static_cast<std::shared_ptr<float[]> *>(p);
-    delete ptr;
-  });
-  return py::array(py::buffer_info(data.get(), sizeof(float),
-                                   py::format_descriptor<float>::format(), ndim,
-                                   shape, strides),
-                   capsule);
-}
-
-std::vector<size_t>
-resolve_output_indices(py::object output_names_obj,
-                       const std::vector<std::string> &all_names) {
-  std::vector<size_t> indices;
-  if (output_names_obj.is_none()) {
-    indices.resize(all_names.size());
-    for (size_t i = 0; i < all_names.size(); ++i) {
-      indices[i] = i;
-    }
-    return indices;
-  }
-  if (!py::isinstance<py::sequence>(output_names_obj)) {
-    throw std::runtime_error("output_names must be a sequence or None");
-  }
-  py::sequence seq = output_names_obj.cast<py::sequence>();
-  indices.reserve(seq.size());
-  for (auto item : seq) {
-    std::string name = py::cast<std::string>(item);
-    bool found = false;
-    for (size_t i = 0; i < all_names.size(); ++i) {
-      if (all_names[i] == name) {
-        indices.push_back(i);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      throw std::runtime_error("Unknown output name: " + name);
-    }
-  }
-  return indices;
-}
-
-py::object outputs_to_python(const AsyncEzRknn::InferenceResult &outputs,
-                             const std::vector<rknn_tensor_attr> &attrs) {
-  py::list result;
-  for (size_t i = 0; i < outputs.size(); ++i) {
-    result.append(make_output_array(outputs[i], attrs[i]));
-  }
+  if (result.empty())
+    throw std::runtime_error("schedule must not be empty");
   return result;
 }
 
-py::list build_outputs_by_indices(const AsyncEzRknn::InferenceResult &outputs,
-                                  const std::vector<rknn_tensor_attr> &attrs,
-                                  const std::vector<size_t> &indices) {
-  py::list result;
-  for (size_t idx : indices) {
-    if (idx >= outputs.size() || idx >= attrs.size()) {
-      throw std::runtime_error("Output index out of range");
-    }
-    result.append(make_output_array(outputs[idx], attrs[idx]));
-  }
-  return result;
+smr::CoreMask parse_core_mask(py::handle value) {
+  if (!py::isinstance<py::str>(value))
+    throw std::runtime_error("tp_mode must be a string");
+  std::string text = trim(py::cast<std::string>(value));
+  if (text == "auto")
+    return smr::CoreMask::Auto;
+  if (text == "all")
+    return smr::CoreMask::All;
+  if (text == "0")
+    return smr::CoreMask::Core0;
+  if (text == "1")
+    return smr::CoreMask::Core1;
+  if (text == "2")
+    return smr::CoreMask::Core2;
+  if (text == "0,1")
+    return smr::CoreMask::Core01;
+  if (text == "0,1,2")
+    return smr::CoreMask::Core012;
+  throw std::runtime_error("invalid tp_mode");
 }
 
-bool parse_dispatch_batch_flag(const py::object &run_options_obj) {
-  constexpr const char *kDispatchKey = "ztu_modelrt_dispatch_batch";
-  if (run_options_obj.is_none()) {
-    return false;
+py::dict extract_provider_options(py::handle object) {
+  if (object.is_none())
+    return py::dict();
+  if (py::isinstance<py::dict>(object))
+    return py::reinterpret_borrow<py::dict>(object);
+  if (py::isinstance<py::sequence>(object)) {
+    py::sequence sequence = py::reinterpret_borrow<py::sequence>(object);
+    if (sequence.size() == 0)
+      return py::dict();
+    if (py::isinstance<py::dict>(sequence[0]))
+      return sequence[0].cast<py::dict>();
   }
-  if (py::isinstance<py::dict>(run_options_obj)) {
-    py::dict opts = run_options_obj.cast<py::dict>();
-    py::object key = py::str(kDispatchKey);
-    if (!opts.contains(key)) {
-      return false;
+  throw std::runtime_error(
+      "provider_options must be a dict or a sequence whose first item is a dict");
+}
+
+smr::RknnProviderOptions parse_provider_options(py::handle object) {
+  smr::RknnProviderOptions options;
+  for (auto item : extract_provider_options(object)) {
+    const std::string key = py::cast<std::string>(item.first);
+    py::handle value = item.second;
+    if (key == "layout") {
+      std::string layout = py::cast<std::string>(value);
+      std::transform(layout.begin(), layout.end(), layout.begin(), ::tolower);
+      if (layout == "nchw" || layout == "original")
+        options.layout = smr::Layout::Nchw;
+      else if (layout == "nchw_software" || layout == "original_software")
+        options.layout = smr::Layout::NchwSoftware;
+      else if (layout == "nhwc")
+        options.layout = smr::Layout::Nhwc;
+      else if (layout == "any")
+        options.layout = smr::Layout::Any;
+      else
+        throw std::runtime_error("Unknown layout: " + layout);
+    } else if (key == "zero_copy_layout") {
+      std::string layout = py::cast<std::string>(value);
+      if (layout == "nhwc")
+        options.zero_copy_layout = smr::ZeroCopyLayout::Nhwc;
+      else if (layout == "native")
+        options.zero_copy_layout = smr::ZeroCopyLayout::Native;
+      else
+        throw std::runtime_error("Unknown zero_copy_layout: " + layout);
+    } else if (key == "max_queue_size") {
+      options.max_queue_size = static_cast<size_t>(parse_int(value, key.c_str()));
+    } else if (key == "threads_per_core") {
+      options.threads_per_core = static_cast<int>(parse_int(value, key.c_str()));
+    } else if (key == "submit_timeout_ms") {
+      options.submit_timeout_ms = parse_int(value, key.c_str());
+    } else if (key == "sequential_callbacks") {
+      options.sequential_callbacks = parse_bool(value, key.c_str());
+    } else if (key == "schedule") {
+      options.schedule = parse_schedule(value);
+    } else if (key == "tp_mode") {
+      options.tp_mode = parse_core_mask(value);
+    } else if (key == "enable_pacing") {
+      options.enable_pacing = parse_bool(value, key.c_str());
+    } else if (key == "disable_dup_context") {
+      options.disable_dup_context = parse_bool(value, key.c_str());
+    } else if (key == "custom_op_path" || key == "custom_op_paths") {
+      auto paths = parse_paths(value, key.c_str());
+      options.custom_op_paths.insert(options.custom_op_paths.end(), paths.begin(),
+                                     paths.end());
+    } else if (key == "custom_op_default_path" ||
+               key == "load_custom_ops_from_default_path") {
+      options.custom_op_default_path = parse_bool(value, key.c_str());
+    } else {
+      throw std::runtime_error("Unknown provider_options key: " + key);
     }
-    return parse_bool_like(opts[key], kDispatchKey);
   }
-  if (py::hasattr(run_options_obj, "get_run_config_entry")) {
+  return options;
+}
+
+smr::RunOptions parse_run_options(py::handle object) {
+  smr::RunOptions result;
+  constexpr const char *key = "ztu_modelrt_dispatch_batch";
+  if (object.is_none())
+    return result;
+  if (py::isinstance<py::dict>(object)) {
+    py::dict values = py::reinterpret_borrow<py::dict>(object);
+    if (values.contains(py::str(key)))
+      result.SetDispatchBatch(parse_bool(values[py::str(key)], key));
+    return result;
+  }
+  if (py::hasattr(object, "get_run_config_entry")) {
     try {
-      py::object value =
-          run_options_obj.attr("get_run_config_entry")(kDispatchKey);
-      return parse_bool_like(value, kDispatchKey);
+      result.SetDispatchBatch(
+          parse_bool(object.attr("get_run_config_entry")(key), key));
     } catch (const py::error_already_set &) {
       PyErr_Clear();
-      return false;
     }
   }
-  return false;
+  return result;
 }
 
-class InferenceSession {
+class PyOrtValue {
 public:
-  ~InferenceSession() {
-    // Avoid deadlock: Async worker/callback threads may need the GIL while
-    // shutting down callbacks that hold Python objects.
-    py::gil_scoped_release release;
-    zero_copy_.reset();
-    rknn_.reset();
+  explicit PyOrtValue(smr::Value value, py::object owner = py::none())
+      : value_(std::move(value)), owner_(std::move(owner)) {}
+
+  smr::Value &value() { return value_; }
+  const smr::Value &value() const { return value_; }
+
+  py::array numpy() const {
+    const auto info = value_.GetTensorTypeAndShapeInfo();
+    py::array result(element_to_dtype(info.GetElementType()), info.GetShape());
+    value_.CopyTo(result.mutable_data(), static_cast<size_t>(result.nbytes()));
+    return result;
   }
 
-  InferenceSession(const std::string &model_path, const SessionConfig &config,
-                   const InferenceSession *use_weight_from = nullptr,
-                   py::object use_weight_from_obj = py::none())
-      : use_weight_from_(std::move(use_weight_from_obj)),
-        pipeline_depth_(0), pipeline_initialized_(false),
-        nchw_software_(false),
-        submit_timeout_(std::chrono::milliseconds(config.submit_timeout_ms)) {
-    const bool has_custom_op_request =
-        !config.custom_op_paths.empty() || config.custom_op_default_path;
-    if (use_weight_from != nullptr && has_custom_op_request) {
-      throw std::runtime_error(
-          "use_weight_from cannot be combined with custom-op loading");
-    }
-
-    const bool disable_dup_context =
-        config.disable_dup_context || has_custom_op_request ||
-        use_weight_from != nullptr;
-
-    if (has_custom_op_request) {
-      emit_python_user_warning(
-          "Custom op loading requested; dup_context is disabled for this "
-          "session to avoid known RKNN stability issues.");
-    }
-
-    AsyncEzRknn::Layout layout_enum = AsyncEzRknn::Layout::ORIGINAL;
-    std::string layout_lower = config.layout;
-    for (auto &c : layout_lower) {
-      c = static_cast<char>(::tolower(c));
-    }
-    if (layout_lower == "nchw" || layout_lower == "original") {
-      layout_enum = AsyncEzRknn::Layout::NCHW;
-    } else if (layout_lower == "nchw_software" ||
-               layout_lower == "original_software") {
-      layout_enum = AsyncEzRknn::Layout::NHWC;
-      nchw_software_ = true;
-    } else if (layout_lower == "nhwc") {
-      layout_enum = AsyncEzRknn::Layout::NHWC;
-    } else if (layout_lower == "any") {
-      layout_enum = AsyncEzRknn::Layout::ANY;
-    } else {
-      throw std::runtime_error("Unknown layout: " + config.layout);
-    }
-
-    std::optional<rknn_context> shared_weight_master_ctx = std::nullopt;
-    if (use_weight_from != nullptr) {
-      if (use_weight_from->rknn_ == nullptr ||
-          use_weight_from->rknn_->contexts.empty() ||
-          use_weight_from->rknn_->contexts[0] == 0) {
-        throw std::runtime_error(
-            "use_weight_from must reference an initialized master session");
-      }
-      shared_weight_master_ctx = use_weight_from->rknn_->contexts[0];
-    }
-
-    rknn_ = std::make_shared<AsyncEzRknn>(
-        model_path, layout_enum, config.max_queue_size, config.threads_per_core,
-        config.sequential_callbacks, config.schedule, config.tp_core_mask,
-        config.enable_pacing, disable_dup_context, shared_weight_master_ctx);
-    if (rknn_->sdk_version_warning().has_value()) {
-      emit_python_user_warning(rknn_->sdk_version_warning().value());
-    }
-    for (const auto &custom_op_path : config.custom_op_paths) {
-      rknn_->load_custom_op(custom_op_path);
-    }
-    if (config.custom_op_default_path) {
-      rknn_->load_custom_ops_from_default_path();
-    }
-    if (has_custom_op_request) {
-      rknn_->register_loaded_custom_ops();
-    }
-    if (rknn_->contexts.empty() || rknn_->contexts[0] == 0) {
-      throw std::runtime_error("Async RKNN context is not available");
-    }
-    ZeroCopyInputLayout zero_copy_input_layout = ZeroCopyInputLayout::NCHW;
-    if (layout_lower == "nhwc") {
-      zero_copy_input_layout = ZeroCopyInputLayout::NHWC;
-    } else if (layout_lower == "any") {
-      zero_copy_input_layout = ZeroCopyInputLayout::ANY;
-    }
-    ZeroCopyLayoutMode zero_copy_layout_mode = ZeroCopyLayoutMode::NHWC;
-    std::string zero_copy_layout_lower = config.zero_copy_layout;
-    for (auto &c : zero_copy_layout_lower) {
-      c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-    }
-    if (zero_copy_layout_lower == "nhwc") {
-      zero_copy_layout_mode = ZeroCopyLayoutMode::NHWC;
-    } else if (zero_copy_layout_lower == "native") {
-      zero_copy_layout_mode = ZeroCopyLayoutMode::NATIVE;
-    } else {
-      throw std::runtime_error(
-          "Unknown zero_copy_layout: " + config.zero_copy_layout +
-          ", expected 'nhwc' or 'native'");
-    }
-    auto zero_copy_holder = std::make_shared<RknnContextHolder>(
-        rknn_->contexts[0], false, std::static_pointer_cast<void>(rknn_));
-    zero_copy_ = std::make_shared<ZeroCopyEzRknn>(std::move(zero_copy_holder),
-                                                  zero_copy_input_layout,
-                                                  zero_copy_layout_mode);
-
-    input_attrs_ = rknn_->input_attrs;
-    output_attrs_ = rknn_->output_attrs;
-
-    if (nchw_software_) {
-      for (auto &attr : input_attrs_) {
-        if (attr.n_dims == 4) {
-          auto n = attr.dims[0];
-          auto h = attr.dims[1];
-          auto w = attr.dims[2];
-          auto c = attr.dims[3];
-          attr.dims[0] = n;
-          attr.dims[1] = c;
-          attr.dims[2] = h;
-          attr.dims[3] = w;
-          if (attr.fmt == RKNN_TENSOR_NHWC) {
-            attr.fmt = RKNN_TENSOR_NCHW;
-          }
-        }
-      }
-    }
-
-    input_names_.reserve(input_attrs_.size());
-    for (size_t i = 0; i < input_attrs_.size(); ++i) {
-      const auto &attr = input_attrs_[i];
-      std::string name =
-          attr.name[0] ? std::string(attr.name) : "input_" + std::to_string(i);
-      input_names_.push_back(name);
-    }
-
-    output_names_.reserve(output_attrs_.size());
-    for (size_t i = 0; i < output_attrs_.size(); ++i) {
-      const auto &attr = output_attrs_[i];
-      std::string name =
-          attr.name[0] ? std::string(attr.name) : "output_" + std::to_string(i);
-      output_names_.push_back(name);
-    }
-  }
-
-  py::list run(py::object output_names_obj, py::object input_feed,
-               py::object run_options) {
-    bool dispatch_batch = parse_dispatch_batch_flag(run_options);
-    auto output_indices =
-        resolve_output_indices(output_names_obj, output_names_);
-    auto inputs = parse_input_feed(input_feed, dispatch_batch);
-    if (dispatch_batch) {
-      return run_batch(std::move(inputs), output_indices);
-    }
-    auto result = run_sync(std::move(inputs));
-    return build_outputs(result.first.outputs, result.second, output_indices);
-  }
-
-  py::none run_async(py::object output_names_obj, py::object input_feed,
-                     py::object callback, py::object user_data,
-                     py::object run_options) {
-    if (callback.is_none() || !PyCallable_Check(callback.ptr())) {
-      throw std::runtime_error("callback must be callable");
-    }
-    if (parse_dispatch_batch_flag(run_options)) {
-      throw std::runtime_error(
-          "run_async does not support ztu_modelrt_dispatch_batch=True");
-    }
-
-    auto output_indices =
-        resolve_output_indices(output_names_obj, output_names_);
-    auto inputs = parse_input_feed(input_feed, false);
-    auto views = to_input_views(inputs);
-    auto cb_shared = make_py_shared(callback.cast<py::function>());
-    auto user_data_shared = make_py_shared(user_data);
-    auto indices_shared =
-        std::make_shared<std::vector<size_t>>(std::move(output_indices));
-
-    {
-      py::gil_scoped_release release;
-      submit_task_async_blocking(
-          views,
-          [this, cb_shared, user_data_shared, indices_shared](
-              size_t task_id, AsyncEzRknn::InferenceResponse response) {
-            py::gil_scoped_acquire gil;
-            try {
-              if (!response.error_message.empty()) {
-                (*cb_shared)(py::none(), *user_data_shared,
-                             py::str(response.error_message));
-                return;
-              }
-              auto attrs = rknn_->takeTaskOutputAttrs(task_id);
-              if (attrs.empty()) {
-                attrs = output_attrs_;
-              }
-              py::list result = build_outputs_by_indices(
-                  response.outputs, attrs, *indices_shared);
-              (*cb_shared)(result, *user_data_shared, py::str(""));
-            } catch (const py::error_already_set &e) {
-              PyErr_WriteUnraisable(e.value().ptr());
-            } catch (const std::exception &e) {
-              try {
-                (*cb_shared)(py::none(), *user_data_shared, py::str(e.what()));
-              } catch (const py::error_already_set &e2) {
-                PyErr_WriteUnraisable(e2.value().ptr());
-              }
-            }
-          });
-    }
-    return py::none();
-  }
-
-  py::object run_pipeline(py::object input_feed, size_t depth, bool reset) {
-    if (depth == 0) {
-      throw std::runtime_error("pipeline depth must be > 0");
-    }
-
-    auto inputs = parse_input_feed(input_feed, false);
-    auto views = to_input_views(inputs);
-    PendingResult pending;
-    pending.future = submit_task_blocking(views);
-
-    std::unique_lock<std::mutex> lock(pipeline_mutex_);
-    if (!pipeline_initialized_ || reset || depth != pipeline_depth_) {
-      pipeline_depth_ = depth;
-      pipeline_initialized_ = true;
-      while (!pipeline_queue_.empty()) {
-        pipeline_queue_.pop();
-      }
-    }
-
-    pipeline_queue_.push(std::move(pending));
-    if (pipeline_queue_.size() <= pipeline_depth_) {
-      return py::none();
-    }
-
-    PendingResult ready = std::move(pipeline_queue_.front());
-    pipeline_queue_.pop();
-    lock.unlock();
-
-    std::pair<AsyncEzRknn::InferenceResponse, std::vector<rknn_tensor_attr>>
-        result_pack;
-    {
-      py::gil_scoped_release release;
-      result_pack = ready.future.get();
-    }
-    if (!result_pack.first.error_message.empty()) {
-      throw std::runtime_error(result_pack.first.error_message);
-    }
-    return outputs_to_python(result_pack.first.outputs, result_pack.second);
-  }
-
-  std::vector<std::string> input_names() const { return input_names_; }
-  std::vector<std::string> output_names() const { return output_names_; }
-  std::vector<NodeArgInfo> get_inputs() const {
-    return build_node_args(input_attrs_, input_names_);
-  }
-  std::vector<NodeArgInfo> get_outputs() const {
-    return build_node_args(output_attrs_, output_names_);
-  }
-  ModelMetadataInfo get_modelmeta() const {
-    ModelMetadataInfo info;
-    const std::string &custom_string = rknn_->custom_string();
-    if (!custom_string.empty()) {
-      info.custom_metadata_map.emplace("rknn_custom_string", custom_string);
-    }
-    return info;
-  }
-
-  std::shared_ptr<RknnIoBinding> io_binding() {
-    return std::make_shared<RknnIoBinding>(zero_copy_backend());
-  }
-
-  void run_with_iobinding(RknnIoBinding &binding, py::object run_options) {
-    (void)run_options;
-    auto backend = zero_copy_backend();
-    py::gil_scoped_release release;
-    backend->run_with_iobinding(binding);
-  }
-
-  std::vector<NodeArgInfo> get_native_inputs() {
-    auto backend = zero_copy_backend();
-    return build_node_args(backend->native_input_attrs(),
-                           backend->input_names());
-  }
-
-  std::vector<NodeArgInfo> get_native_outputs() {
-    auto backend = zero_copy_backend();
-    return build_node_args(backend->native_output_attrs(),
-                           backend->output_names());
-  }
-
-  std::shared_ptr<ZeroCopyEzRknn> zero_copy_backend() {
-    if (!zero_copy_) {
-      throw std::runtime_error("Zero-copy RKNN backend is not available");
-    }
-    return zero_copy_;
+  void update(py::array source) {
+    py::array contiguous = py::array::ensure(source, py::array::c_style);
+    if (!contiguous)
+      throw std::runtime_error("source must be a contiguous numpy array");
+    value_.Update(contiguous.data(), static_cast<size_t>(contiguous.nbytes()),
+                  array_shape(contiguous), dtype_to_element(contiguous.dtype()));
   }
 
 private:
-  std::vector<ParsedInput> parse_input_feed(const py::object &input_feed,
-                                            bool allow_batch) {
-    size_t expected_inputs = input_attrs_.size();
-    if (py::isinstance<py::array>(input_feed)) {
-      if (expected_inputs != 1) {
-        throw std::runtime_error("Model expects " +
-                                 std::to_string(expected_inputs) +
-                                 " inputs, but a single array was given");
-      }
-      return {parse_input_array(input_feed, 0, allow_batch)};
-    }
+  smr::Value value_;
+  py::object owner_;
+};
 
-    if (py::isinstance<py::dict>(input_feed)) {
-      py::dict d = input_feed.cast<py::dict>();
-      if (d.size() != expected_inputs) {
-        throw std::runtime_error("Input dict size mismatch: expected " +
-                                 std::to_string(expected_inputs) + ", got " +
-                                 std::to_string(static_cast<size_t>(d.size())));
-      }
-      std::vector<ParsedInput> inputs;
-      inputs.reserve(expected_inputs);
-      for (size_t i = 0; i < expected_inputs; ++i) {
-        py::object key = py::str(input_names_[i]);
-        if (!d.contains(key)) {
-          throw std::runtime_error("Missing input: " + input_names_[i]);
-        }
-        inputs.push_back(parse_input_array(d[key], i, allow_batch));
-      }
-      return inputs;
-    }
+py::array ensure_contiguous(py::handle object) {
+  py::array array = py::array::ensure(object, py::array::c_style);
+  if (!array)
+    throw std::runtime_error("Input must be a numpy array");
+  return array;
+}
 
-    if (py::isinstance<py::sequence>(input_feed)) {
-      py::sequence seq = input_feed.cast<py::sequence>();
-      if (static_cast<size_t>(seq.size()) != expected_inputs) {
-        throw std::runtime_error(
-            "Input list size mismatch: expected " +
-            std::to_string(expected_inputs) + ", got " +
-            std::to_string(static_cast<size_t>(seq.size())));
-      }
-      std::vector<ParsedInput> inputs;
-      inputs.reserve(expected_inputs);
-      for (size_t i = 0; i < expected_inputs; ++i) {
-        inputs.push_back(parse_input_array(seq[i], i, allow_batch));
-      }
-      return inputs;
-    }
+smr::Value value_from_array(py::array array) {
+  const auto shape = array_shape(array);
+  return smr::Value::CreateTensor(
+      smr::MemoryInfo::CreateCpu(), array.mutable_data(),
+      static_cast<size_t>(array.nbytes()), shape.data(), shape.size(),
+      dtype_to_element(array.dtype()));
+}
 
-    throw std::runtime_error(
-        "input_feed must be a numpy array, list/tuple, or dict");
+std::shared_ptr<PyOrtValue> wrap_value(smr::Value value) {
+  return std::make_shared<PyOrtValue>(std::move(value));
+}
+
+struct PreparedCall {
+  std::vector<std::string> names;
+  std::vector<const char *> name_ptrs;
+  std::vector<py::array> arrays;
+  std::vector<smr::Value> values;
+};
+
+class PySession;
+
+class PyIOBinding {
+public:
+  explicit PyIOBinding(smr::Session &session)
+      : session_(&session), binding_(std::make_unique<smr::IoBinding>(session)) {}
+
+  smr::IoBinding &binding() { return *binding_; }
+  void bind_cpu_input(const std::string &name, py::array array) {
+    auto contiguous = ensure_contiguous(array);
+    auto value = value_from_array(contiguous);
+    binding_->BindInput(name.c_str(), value);
   }
-
-  py::array ensure_array(py::handle obj, size_t input_index) {
-    (void)input_index;
-    py::array array = py::array::ensure(obj, py::array::c_style);
-    if (!array) {
-      throw std::runtime_error("Input must be a numpy array");
-    }
-    return array;
+  void bind_value_input(const std::string &name,
+                        const std::shared_ptr<PyOrtValue> &value) {
+    binding_->BindInput(name.c_str(), value->value());
   }
-
-  ParsedInput parse_input_array(py::handle obj, size_t input_index,
-                                bool allow_batch) {
-    py::array user_array = ensure_array(obj, input_index);
-    ParsedInput parsed = parse_array(user_array, input_attrs_[input_index],
-                                     allow_batch, input_names_[input_index]);
-    if (!nchw_software_ || input_attrs_[input_index].n_dims != 4) {
-      return parsed;
-    }
-
-    py::array native_array = transpose_nchw_to_nhwc(user_array);
-    return parse_array(native_array, rknn_->input_attrs[input_index],
-                       allow_batch, input_names_[input_index]);
+  void bind_value_output(const std::string &name,
+                         const std::shared_ptr<PyOrtValue> &value) {
+    binding_->BindOutput(name.c_str(), value->value());
   }
-
-  py::array transpose_nchw_to_nhwc(const py::array &array) {
-    if (array.ndim() != 4) {
-      return array;
+  void bind_output(const std::string &name, const std::string &device_type,
+                   int device_id, smr::TensorElementType element_type,
+                   std::optional<std::vector<int64_t>> shape,
+                   uint64_t memory_flags) {
+    const auto info = device_type == "cpu"
+                          ? smr::MemoryInfo::CreateCpu(device_id)
+                          : smr::MemoryInfo::CreateRknpu2(device_id);
+    if (device_type != "cpu" && device_type != "rknpu2")
+      throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
+    if (element_type != smr::TensorElementType::Unknown || shape.has_value()) {
+      auto validation = session_->CreateIoValue(
+          name, smr::IoKind::Output, smr::MemoryInfo::CreateRknpu2(),
+          element_type, shape, memory_flags);
+      (void)validation;
     }
-    py::object transposed = array.attr("transpose")(py::make_tuple(0, 2, 3, 1));
-    py::array contiguous = py::array::ensure(transposed, py::array::c_style);
-    if (!contiguous) {
-      throw std::runtime_error("Failed to transpose input to NHWC");
-    }
-    return contiguous;
+    binding_->BindOutput(name.c_str(), info);
   }
-
-  std::vector<AsyncEzRknn::InputView>
-  to_input_views(const std::vector<ParsedInput> &inputs) {
-    std::vector<AsyncEzRknn::InputView> views;
-    views.reserve(inputs.size());
-    for (const auto &in : inputs) {
-      views.push_back(
-          AsyncEzRknn::InputView{in.data, in.bytes, in.type, in.n_dims, in.dims});
-    }
-    return views;
-  }
-
-  void submit_task_async_blocking(
-      const std::vector<AsyncEzRknn::InputView> &views,
-      AsyncEzRknn::InferenceCallback callback) {
-    const auto deadline = std::chrono::steady_clock::now() + submit_timeout_;
-    while (true) {
-      auto submitted = rknn_->asyncInferenceDyn(callback, views);
-      if (submitted.has_value()) {
-        return;
-      }
-      if (!rknn_->wait_for_submit_capacity_until(deadline)) {
-        throw std::runtime_error(
-            "run_async submit timed out: async queue/callback pipeline is "
-            "saturated");
-      }
-    }
-  }
-
-  std::future<std::pair<AsyncEzRknn::InferenceResponse,
-                        std::vector<rknn_tensor_attr>>>
-  submit_task_blocking(const std::vector<AsyncEzRknn::InputView> &views) {
-    using ResultPack =
-        std::pair<AsyncEzRknn::InferenceResponse, std::vector<rknn_tensor_attr>>;
-    auto promise = std::make_shared<std::promise<ResultPack>>();
-    auto future = promise->get_future();
-    const auto deadline = std::chrono::steady_clock::now() + submit_timeout_;
-    while (true) {
-      auto submitted = rknn_->asyncInferenceDyn(
-          [this, promise](size_t task_id, AsyncEzRknn::InferenceResponse response) {
-            try {
-              std::vector<rknn_tensor_attr> attrs;
-              if (response.error_message.empty()) {
-                attrs = rknn_->takeTaskOutputAttrs(task_id);
-                if (attrs.empty()) {
-                  attrs = output_attrs_;
-                }
-              }
-              promise->set_value(ResultPack{std::move(response), std::move(attrs)});
-            } catch (...) {
-              try {
-                promise->set_exception(std::current_exception());
-              } catch (...) {
-              }
-            }
-          },
-          views);
-      if (submitted.has_value()) {
-        break;
-      }
-      if (!rknn_->wait_for_submit_capacity_until(deadline)) {
-        throw std::runtime_error(
-            "run submit timed out: async queue/callback pipeline is "
-            "saturated");
-      }
-    }
-    return future;
-  }
-
-  std::pair<AsyncEzRknn::InferenceResponse, std::vector<rknn_tensor_attr>>
-  run_sync(std::vector<ParsedInput> inputs) {
-    auto views = to_input_views(inputs);
-    auto future = submit_task_blocking(views);
-    py::gil_scoped_release release;
-    auto result = future.get();
-    if (!result.first.error_message.empty()) {
-      throw std::runtime_error(result.first.error_message);
-    }
-    if (result.second.size() != output_attrs_.size()) {
-      throw std::runtime_error("Output attr count mismatch");
-    }
+  std::vector<std::shared_ptr<PyOrtValue>> outputs() const {
+    auto values = binding_->GetOutputValues();
+    std::vector<std::shared_ptr<PyOrtValue>> result;
+    result.reserve(values.size());
+    for (auto &value : values)
+      result.push_back(wrap_value(std::move(value)));
     return result;
   }
-
-  py::list build_outputs(const AsyncEzRknn::InferenceResult &outputs,
-                         const std::vector<rknn_tensor_attr> &attrs,
-                         const std::vector<size_t> &indices) {
+  py::list copy_outputs() const {
     py::list result;
-    for (size_t idx : indices) {
-      if (idx >= outputs.size() || idx >= attrs.size()) {
-        throw std::runtime_error("Output index out of range");
-      }
-      result.append(make_output_array(outputs[idx], attrs[idx]));
-    }
+    for (const auto &value : outputs())
+      result.append(value->numpy());
     return result;
   }
 
-  py::list run_batch(std::vector<ParsedInput> inputs,
-                     const std::vector<size_t> &indices) {
-    if (inputs.empty()) {
-      throw std::runtime_error("No inputs provided");
+private:
+  smr::Session *session_;
+  std::unique_ptr<smr::IoBinding> binding_;
+};
+
+class PySession {
+public:
+  PySession(py::handle path_or_bytes, py::handle provider_options,
+            PySession *weight_master)
+      : env_("ztu_somemodelruntime_ez_rknn_async") {
+    env_.SetWarningHandler(emit_python_warning);
+    smr::SessionOptions options;
+    options.SetRknnProviderOptions(parse_provider_options(provider_options));
+    if (py::isinstance<py::bytes>(path_or_bytes)) {
+      std::string bytes = py::cast<std::string>(path_or_bytes);
+      session_ = std::make_shared<smr::Session>(
+          env_, bytes.data(), bytes.size(), options,
+          weight_master ? weight_master->session_.get() : nullptr);
+    } else {
+      const std::string path = parse_path(path_or_bytes, "path_or_bytes");
+      session_ = std::make_shared<smr::Session>(
+          env_, path.c_str(), options,
+          weight_master ? weight_master->session_.get() : nullptr);
     }
-    size_t batch = 0;
-    std::vector<size_t> sample_bytes(inputs.size(), 0);
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      auto info = inputs[i].array.request();
-      if (info.ndim < 1) {
-        throw std::runtime_error("Batch input must have ndim >= 1");
-      }
-      size_t this_batch = static_cast<size_t>(info.shape[0]);
-      if (i == 0) {
-        batch = this_batch;
-      } else if (this_batch != batch) {
-        throw std::runtime_error("Batch size mismatch across inputs");
-      }
+  }
 
-      const auto &attr = input_attrs_[i];
-      if (attr.n_dims == 0 || (attr.dims[0] != 1 && attr.dims[0] != 0)) {
-        throw std::runtime_error(
-            "Batch mode requires model input batch dimension == 1");
-      }
-      if (batch == 0) {
-        throw std::runtime_error("Batch size must be greater than 0");
-      }
-      const size_t total_bytes = static_cast<size_t>(inputs[i].bytes);
-      if (total_bytes % batch != 0) {
-        throw std::runtime_error("Batch input bytes mismatch at input index " +
-                                 std::to_string(i));
-      }
-      sample_bytes[i] = total_bytes / batch;
+  ~PySession() {
+    if (session_) {
+      py::gil_scoped_release release;
+      session_.reset();
     }
+  }
 
-    std::vector<
-        std::future<std::pair<AsyncEzRknn::InferenceResponse,
-                              std::vector<rknn_tensor_attr>>>>
-        futures;
-    futures.reserve(batch);
+  smr::Session &session() { return *session_; }
 
-    for (size_t b = 0; b < batch; ++b) {
-      std::vector<ParsedInput> per_inputs;
-      per_inputs.reserve(inputs.size());
-      for (size_t i = 0; i < inputs.size(); ++i) {
-        auto info = inputs[i].array.request();
-        size_t stride0 = static_cast<size_t>(info.strides[0]);
-        const char *base = static_cast<const char *>(info.ptr);
-        const char *ptr = base + stride0 * b;
-
-        std::array<uint32_t, RKNN_MAX_DIMS> dims = inputs[i].dims;
-        if (inputs[i].n_dims == 0) {
-          throw std::runtime_error("Batch input rank must be >= 1");
-        }
-        dims[0] = 1;
-        ParsedInput one{inputs[i].array, inputs[i].type, sample_bytes[i], ptr,
-                        inputs[i].n_dims, dims};
-        per_inputs.push_back(one);
+  PreparedCall prepare_inputs(py::handle input_feed) {
+    PreparedCall call;
+    const size_t count = session_->GetInputCount();
+    call.names.reserve(count);
+    call.arrays.reserve(count);
+    if (py::isinstance<py::array>(input_feed)) {
+      if (count != 1)
+        throw std::runtime_error("Model expects multiple inputs");
+      call.names.push_back(session_->GetInputName(0));
+      call.arrays.push_back(ensure_contiguous(input_feed));
+    } else if (py::isinstance<py::dict>(input_feed)) {
+      py::dict values = py::reinterpret_borrow<py::dict>(input_feed);
+      if (static_cast<size_t>(values.size()) != count)
+        throw std::runtime_error("Input dict size mismatch");
+      for (size_t i = 0; i < count; ++i) {
+        const auto &name = session_->GetInputName(i);
+        if (!values.contains(py::str(name)))
+          throw std::runtime_error("Missing input: " + name);
+        call.names.push_back(name);
+        call.arrays.push_back(ensure_contiguous(values[py::str(name)]));
       }
-      auto per_views = to_input_views(per_inputs);
-      futures.push_back(submit_task_blocking(per_views));
+    } else if (py::isinstance<py::sequence>(input_feed)) {
+      py::sequence values = py::reinterpret_borrow<py::sequence>(input_feed);
+      if (static_cast<size_t>(values.size()) != count)
+        throw std::runtime_error("Input list size mismatch");
+      for (size_t i = 0; i < count; ++i) {
+        call.names.push_back(session_->GetInputName(i));
+        call.arrays.push_back(ensure_contiguous(values[i]));
+      }
+    } else {
+      throw std::runtime_error(
+          "input_feed must be a numpy array, list/tuple, or dict");
     }
+    for (const auto &name : call.names)
+      call.name_ptrs.push_back(name.c_str());
+    for (auto &array : call.arrays)
+      call.values.push_back(value_from_array(array));
+    return call;
+  }
 
-    std::vector<AsyncEzRknn::InferenceResult> batch_outputs;
-    std::vector<std::vector<rknn_tensor_attr>> batch_attrs;
-    batch_outputs.resize(batch);
-    batch_attrs.resize(batch);
+  std::vector<std::string> output_names(py::handle value,
+                                        bool expand_all = false) const {
+    std::vector<std::string> result;
+    if (value.is_none()) {
+      if (expand_all)
+        for (size_t i = 0; i < session_->GetOutputCount(); ++i)
+          result.push_back(session_->GetOutputName(i));
+      return result;
+    }
+    if (!py::isinstance<py::sequence>(value))
+      throw std::runtime_error("output_names must be a sequence or None");
+    for (py::handle name : value.cast<py::sequence>())
+      result.push_back(py::cast<std::string>(name));
+    return result;
+  }
+
+  py::list run(py::handle output_names_object, py::handle input_feed,
+               py::handle run_options_object) {
+    auto call = prepare_inputs(input_feed);
+    auto names = output_names(output_names_object);
+    std::vector<const char *> name_ptrs;
+    for (const auto &name : names)
+      name_ptrs.push_back(name.c_str());
+    const bool all_outputs = names.empty() && output_names_object.is_none();
+    const auto parsed_options = parse_run_options(run_options_object);
+    std::vector<smr::Value> outputs;
     {
       py::gil_scoped_release release;
-      for (size_t b = 0; b < batch; ++b) {
-        auto one = futures[b].get();
-        if (!one.first.error_message.empty()) {
-          throw std::runtime_error(one.first.error_message);
-        }
-        batch_outputs[b] = std::move(one.first.outputs);
-        batch_attrs[b] = std::move(one.second);
-        if (batch_outputs[b].empty()) {
-          throw std::runtime_error("Inference failed in batch mode");
-        }
-      }
+      outputs = session_->Run(
+          parsed_options, call.name_ptrs.data(), call.values.data(),
+          call.values.size(), all_outputs ? nullptr : name_ptrs.data(),
+          names.size());
     }
-
-    if (batch_attrs.empty() || batch_attrs[0].size() != output_attrs_.size()) {
-      throw std::runtime_error("Invalid output attrs in batch mode");
-    }
-    for (size_t b = 1; b < batch_attrs.size(); ++b) {
-      if (batch_attrs[b].size() != batch_attrs[0].size()) {
-        throw std::runtime_error("Batch output attr count mismatch");
-      }
-      for (size_t i = 0; i < batch_attrs[b].size(); ++i) {
-        if (batch_attrs[b][i].n_dims != batch_attrs[0][i].n_dims) {
-          throw std::runtime_error("Batch output rank mismatch");
-        }
-        for (uint32_t d = 0; d < batch_attrs[b][i].n_dims; ++d) {
-          if (batch_attrs[b][i].dims[d] != batch_attrs[0][i].dims[d]) {
-            throw std::runtime_error("Batch output shape mismatch");
-          }
-        }
-      }
-    }
-
     py::list result;
-    for (size_t out_idx : indices) {
-      const auto &attr = batch_attrs[0][out_idx];
-      size_t per_sample_elems = attr.n_elems;
-      std::vector<ssize_t> shape;
-      if (attr.n_dims == 0) {
-        shape = {static_cast<ssize_t>(batch)};
-      } else {
-        shape.reserve(attr.n_dims);
-        for (uint32_t d = 0; d < attr.n_dims; ++d) {
-          shape.push_back(static_cast<ssize_t>(d == 0 ? batch : attr.dims[d]));
-        }
-      }
-
-      py::array_t<float> out_array(shape);
-      float *dst = static_cast<float *>(out_array.request().ptr);
-
-      for (size_t b = 0; b < batch; ++b) {
-        const auto &out = batch_outputs[b][out_idx];
-        std::memcpy(dst + b * per_sample_elems, out.get(),
-                    per_sample_elems * sizeof(float));
-      }
-      result.append(out_array);
-    }
-
+    for (auto &output : outputs)
+      result.append(wrap_value(std::move(output))->numpy());
     return result;
   }
 
-  static std::vector<NodeArgInfo>
-  build_node_args(const std::vector<rknn_tensor_attr> &attrs,
-                  const std::vector<std::string> &names) {
-    std::vector<NodeArgInfo> infos;
-    infos.reserve(attrs.size());
-    for (size_t i = 0; i < attrs.size(); ++i) {
-      NodeArgInfo info;
-      info.name = names[i];
-      info.shape.reserve(attrs[i].n_dims);
-      for (uint32_t d = 0; d < attrs[i].n_dims; ++d) {
-        info.shape.push_back(static_cast<int64_t>(attrs[i].dims[d]));
+  struct AsyncState {
+    std::vector<smr::Value> outputs;
+    py::function callback;
+    py::object user_data;
+  };
+
+  static void async_complete(void *opaque, smr::Value *, size_t count,
+                             const char *error) {
+    py::gil_scoped_acquire gil;
+    // Keep the GIL alive while AsyncState is destroyed: it owns the Python
+    // callback and user_data objects.
+    std::unique_ptr<AsyncState> state(static_cast<AsyncState *>(opaque));
+    try {
+      if (error != nullptr && error[0] != '\0') {
+        state->callback(py::none(), state->user_data, py::str(error));
+        return;
       }
-      info.type = rknn_type_to_onnx_str(attrs[i].type);
-      infos.push_back(std::move(info));
+      py::list result;
+      for (size_t i = 0; i < count; ++i)
+        result.append(wrap_value(std::move(state->outputs[i]))->numpy());
+      state->callback(result, state->user_data, py::str(""));
+    } catch (const py::error_already_set &caught) {
+      PyErr_WriteUnraisable(caught.value().ptr());
     }
-    return infos;
   }
 
-  py::object use_weight_from_;
-  std::shared_ptr<AsyncEzRknn> rknn_;
-  std::shared_ptr<ZeroCopyEzRknn> zero_copy_;
-  std::vector<rknn_tensor_attr> input_attrs_;
-  std::vector<rknn_tensor_attr> output_attrs_;
-  std::vector<std::string> input_names_;
-  std::vector<std::string> output_names_;
-  bool nchw_software_;
-  std::chrono::milliseconds submit_timeout_;
+  void run_async(py::handle output_names_object, py::handle input_feed,
+                 py::function callback, py::object user_data,
+                 py::handle run_options_object) {
+    auto call = prepare_inputs(input_feed);
+    auto names = output_names(output_names_object, true);
+    std::vector<const char *> name_ptrs;
+    for (const auto &name : names)
+      name_ptrs.push_back(name.c_str());
+    auto state = std::make_unique<AsyncState>();
+    state->outputs.resize(names.size());
+    state->callback = std::move(callback);
+    state->user_data = std::move(user_data);
+    const auto parsed_options = parse_run_options(run_options_object);
+    auto *raw_state = state.release();
+    try {
+      py::gil_scoped_release release;
+      session_->RunAsync(parsed_options,
+                         call.name_ptrs.data(), call.values.data(),
+                         call.values.size(), name_ptrs.data(),
+                         raw_state->outputs.data(), names.size(),
+                         &PySession::async_complete, raw_state);
+    } catch (...) {
+      delete raw_state;
+      throw;
+    }
+  }
 
-  size_t pipeline_depth_;
-  bool pipeline_initialized_;
-  std::queue<PendingResult> pipeline_queue_;
-  std::mutex pipeline_mutex_;
+  py::object run_pipeline(py::handle input_feed, size_t depth, bool reset) {
+    auto call = prepare_inputs(input_feed);
+    std::optional<std::vector<smr::Value>> outputs;
+    {
+      py::gil_scoped_release release;
+      outputs = session_->RunPipeline(call.name_ptrs.data(), call.values.data(),
+                                      call.values.size(), depth, reset);
+    }
+    if (!outputs)
+      return py::none();
+    py::list result;
+    for (auto &output : *outputs)
+      result.append(wrap_value(std::move(output))->numpy());
+    return result;
+  }
+
+private:
+  smr::Env env_;
+  std::shared_ptr<smr::Session> session_;
 };
+
+std::shared_ptr<PyOrtValue>
+make_session_value(PySession &session, py::array array,
+                   const std::string &device_type, const std::string &name,
+                   const std::string &io_kind, uint64_t memory_flags = 0) {
+  py::array contiguous = ensure_contiguous(array);
+  const auto kind = io_kind == "input" ? smr::IoKind::Input : smr::IoKind::Output;
+  if (io_kind != "input" && io_kind != "output")
+    throw std::runtime_error("io_kind must be 'input' or 'output'");
+  if (device_type == "cpu")
+    return std::make_shared<PyOrtValue>(value_from_array(contiguous), contiguous);
+  if (device_type != "rknpu2")
+    throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
+  auto value = session.session().CreateIoValue(
+      name, kind, smr::MemoryInfo::CreateRknpu2(),
+      smr::TensorElementType::Unknown, std::nullopt, memory_flags);
+  const auto target_type = value.GetTensorTypeAndShapeInfo().GetElementType();
+  if (!contiguous.dtype().is(element_to_dtype(target_type)))
+    contiguous = py::array::ensure(
+        contiguous.attr("astype")(element_to_dtype(target_type)),
+        py::array::c_style);
+  value.Update(contiguous.data(), static_cast<size_t>(contiguous.nbytes()),
+               array_shape(contiguous), target_type);
+  return std::make_shared<PyOrtValue>(std::move(value));
+}
+
+py::dict memory_info_dict(const PyOrtValue &value) {
+  const auto info = value.value().GetMemoryInfo();
+  py::dict result;
+  result["device_type"] =
+      info.device_type == smr::DeviceType::Cpu ? "cpu" : "rknpu2";
+  result["device_id"] = info.device_id;
+  if (info.device_type == smr::DeviceType::Rknpu2) {
+    result["size"] = info.size;
+    result["fd"] = info.fd;
+    result["offset"] = info.offset;
+    result["virt_addr"] = info.virt_addr;
+    result["import_count"] = info.import_count;
+    result["dmabuf_backed"] = info.dmabuf_backed;
+    result["attr_size"] = info.attr_size;
+    result["size_with_stride"] = info.size_with_stride;
+    result["w_stride"] = info.w_stride;
+    result["h_stride"] = info.h_stride;
+    result["fmt"] = info.fmt;
+    result["pass_through"] = info.pass_through;
+  }
+  return result;
+}
 
 } // namespace
 
-PYBIND11_MODULE(_core, m) {
-  m.doc() = "Python bindings for ztu_somemodelruntime_ez_rknn_async.";
+PYBIND11_MODULE(_core, module) {
+  module.doc() = "ORT-style Python bindings for the ztu RKNN runtime.";
 
-  py::class_<NodeArgInfo>(m, "NodeArg")
-      .def_property_readonly("name",
-                             [](const NodeArgInfo &info) { return info.name; })
-      .def_property_readonly("shape",
-                             [](const NodeArgInfo &info) { return info.shape; })
+  py::class_<smr::NodeArg>(module, "NodeArg")
+      .def_property_readonly("name", [](const smr::NodeArg &value) {
+        return value.name;
+      })
+      .def_property_readonly("shape", [](const smr::NodeArg &value) {
+        return value.shape;
+      })
+      .def_property_readonly("type", [](const smr::NodeArg &value) {
+        return value.type;
+      });
+
+  py::class_<smr::ModelMetadata>(module, "ModelMetadata")
       .def_property_readonly(
-          "type", [](const NodeArgInfo &info) { return info.type; },
-          "Type string like 'tensor(float32)'.");
+          "custom_metadata_map", [](const smr::ModelMetadata &value) {
+            return value.custom_metadata_map;
+          });
 
-  py::class_<ModelMetadataInfo>(m, "ModelMetadata")
-      .def_property_readonly("custom_metadata_map",
-                             [](const ModelMetadataInfo &info) {
-                               return info.custom_metadata_map;
-                             },
-                             "Additional model metadata from RKNN runtime.");
-
-  py::class_<RknnOrtValue, std::shared_ptr<RknnOrtValue>>(m, "OrtValue")
+  py::class_<PyOrtValue, std::shared_ptr<PyOrtValue>>(module, "OrtValue")
       .def_static(
           "ortvalue_from_numpy",
           [](py::array array, const std::string &device_type, int device_id,
-             py::object name_obj, py::object session_obj,
-             py::object io_kind_obj, const std::string &layout, bool sync) {
-            (void)device_id;
-            (void)layout;
-            (void)sync;
-            py::array contiguous = py::array::ensure(array, py::array::c_style);
-            if (!contiguous) {
-              throw std::runtime_error("arr must be a contiguous numpy array");
-            }
+             py::object name, py::object session, py::object io_kind,
+             const std::string &, bool) {
+            if (device_id != 0)
+              throw std::runtime_error("RKNN supports device_id 0 only");
             if (device_type == "cpu") {
-              return RknnOrtValue::from_cpu_array(contiguous);
+              auto contiguous = ensure_contiguous(array);
+              return std::make_shared<PyOrtValue>(value_from_array(contiguous),
+                                                  contiguous);
             }
-            if (device_type != "rknpu2") {
-              throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
-            }
-            if (session_obj.is_none() || name_obj.is_none() ||
-                io_kind_obj.is_none()) {
+            if (session.is_none() || name.is_none() || io_kind.is_none())
               throw std::runtime_error(
                   "session, name, and io_kind are required for RKNN OrtValue");
-            }
-            auto *session = session_obj.cast<InferenceSession *>();
-            std::string name = py::cast<std::string>(name_obj);
-            std::string io_kind = py::cast<std::string>(io_kind_obj);
-            auto value = session->zero_copy_backend()->create_value_for_io(
-                name, io_kind, RKNN_TENSOR_TYPE_MAX,
-                RKNN_FLAG_MEMORY_FLAGS_DEFAULT);
-            py::dtype target_dtype =
-                rknn_tensor_type_to_numpy_dtype(value->element_type());
-            py::object dtype_matches =
-                contiguous.attr("dtype").attr("__eq__")(target_dtype);
-            if (!py::cast<bool>(dtype_matches)) {
-              contiguous = py::array::ensure(
-                  contiguous.attr("astype")(target_dtype), py::array::c_style);
-            }
-            value->update_inplace(contiguous);
-            return value;
+            return make_session_value(*session.cast<PySession *>(), array,
+                                      device_type, py::cast<std::string>(name),
+                                      py::cast<std::string>(io_kind));
           },
           py::arg("arr"), py::arg("device_type") = "cpu",
           py::arg("device_id") = 0, py::kw_only(),
@@ -1389,36 +765,36 @@ PYBIND11_MODULE(_core, m) {
           py::arg("sync") = true)
       .def_static(
           "ortvalue_from_shape_and_type",
-          [](py::object shape_obj, py::object element_type_obj,
-             const std::string &device_type, int device_id, py::object name_obj,
-             py::object session_obj, py::object io_kind_obj,
-             const std::string &layout, py::object mem_flags_obj) {
-            (void)device_id;
-            (void)layout;
-            std::vector<int64_t> shape = parse_shape_like(shape_obj, false);
-            rknn_tensor_type element_type =
-                dtype_like_to_rknn(element_type_obj, false);
+          [](py::handle shape_object, py::handle type_object,
+             const std::string &device_type, int device_id, py::object name,
+             py::object session, py::object io_kind, const std::string &,
+             py::handle memory_flags) {
+            if (device_id != 0)
+              throw std::runtime_error("RKNN supports device_id 0 only");
+            auto shape = parse_shape(shape_object);
+            const auto type = dtype_like_to_element(type_object);
             if (device_type == "cpu") {
-              py::array array(rknn_tensor_type_to_numpy_dtype(element_type),
-                              shape);
-              std::memset(array.mutable_data(), 0,
-                          static_cast<size_t>(array.nbytes()));
-              return RknnOrtValue::from_cpu_array(array);
+              smr::AllocatorWithDefaultOptions allocator;
+              return wrap_value(smr::Value::CreateOwnedTensor(
+                  shape.data(), shape.size(), type));
             }
-            if (device_type != "rknpu2") {
+            if (device_type != "rknpu2")
               throw std::runtime_error("device_type must be 'cpu' or 'rknpu2'");
+            if (!session.is_none() && !name.is_none() && !io_kind.is_none()) {
+              const std::string kind_text = py::cast<std::string>(io_kind);
+              const auto kind = kind_text == "input" ? smr::IoKind::Input
+                                                      : smr::IoKind::Output;
+              return wrap_value(session.cast<PySession *>()->session().CreateIoValue(
+                  py::cast<std::string>(name), kind,
+                  smr::MemoryInfo::CreateRknpu2(), type, shape,
+                  parse_memory_flags(memory_flags)));
             }
-            if (!session_obj.is_none() && !name_obj.is_none() &&
-                !io_kind_obj.is_none()) {
-              auto *session = session_obj.cast<InferenceSession *>();
-              std::string name = py::cast<std::string>(name_obj);
-              std::string io_kind = py::cast<std::string>(io_kind_obj);
-              return session->zero_copy_backend()->create_value_for_io(
-                  name, io_kind, element_type, parse_mem_flags(mem_flags_obj),
-                  shape);
-            }
-            return RknnOrtValue::create_generic_rknn(
-                std::move(shape), element_type, parse_mem_flags(mem_flags_obj));
+            std::vector<uint8_t> zeros(
+                smr::TensorTypeAndShapeInfo(type, shape).GetElementCount() *
+                element_to_dtype(type).itemsize());
+            return wrap_value(smr::Value::CreateTensor(
+                smr::MemoryInfo::CreateRknpu2(), zeros.data(), zeros.size(),
+                shape.data(), shape.size(), type));
           },
           py::arg("shape"), py::arg("element_type"),
           py::arg("device_type") = "cpu", py::arg("device_id") = 0,
@@ -1427,193 +803,178 @@ PYBIND11_MODULE(_core, m) {
           py::arg("layout") = "native", py::arg("mem_flags") = "cacheable")
       .def_static(
           "ortvalue_from_dmabuf",
-          [](int fd, py::object shape_obj, py::object element_type_obj,
-             uint32_t size, int32_t offset, py::object virt_addr_obj,
-             py::object session_obj, py::object name_obj, py::object io_kind_obj,
-             const std::string &layout) {
-            (void)layout;
-            std::vector<int64_t> shape = parse_shape_like(shape_obj, false);
-            if (session_obj.is_none() || name_obj.is_none() ||
-                io_kind_obj.is_none()) {
+          [](int fd, py::handle shape_object, py::handle type_object,
+             uint32_t size, int32_t offset, py::object virt_addr,
+             py::object session, py::object name, py::object io_kind,
+             const std::string &) {
+            if (session.is_none() || name.is_none() || io_kind.is_none())
               throw std::runtime_error(
                   "session, name, and io_kind are required for dma-buf OrtValue");
-            }
-            void *virt_addr = nullptr;
-            if (!virt_addr_obj.is_none()) {
-              virt_addr = reinterpret_cast<void *>(
-                  static_cast<uintptr_t>(py::cast<uint64_t>(virt_addr_obj)));
-            }
-            auto *session = session_obj.cast<InferenceSession *>();
-            return session->zero_copy_backend()->create_value_from_fd(
-                py::cast<std::string>(name_obj),
-                py::cast<std::string>(io_kind_obj),
-                dtype_like_to_rknn(element_type_obj, false),
-                static_cast<int32_t>(fd), virt_addr, size, offset, shape);
+            void *address = nullptr;
+            if (!virt_addr.is_none())
+              address = reinterpret_cast<void *>(static_cast<uintptr_t>(
+                  py::cast<uint64_t>(virt_addr)));
+            const std::string kind_text = py::cast<std::string>(io_kind);
+            const auto kind = kind_text == "input" ? smr::IoKind::Input
+                                                    : smr::IoKind::Output;
+            return wrap_value(
+                session.cast<PySession *>()->session().CreateIoValueFromDmaBuf(
+                    py::cast<std::string>(name), kind, fd, size,
+                    dtype_like_to_element(type_object), parse_shape(shape_object),
+                    offset, address));
           },
           py::arg("fd"), py::arg("shape"), py::arg("element_type"),
           py::kw_only(), py::arg("size"), py::arg("offset") = 0,
           py::arg("virt_addr") = py::none(), py::arg("session") = py::none(),
           py::arg("name") = py::none(), py::arg("io_kind") = py::none(),
-          py::arg("layout") = "native",
-          "Create an RKNN OrtValue from a Linux dma-buf file descriptor.")
-      .def("numpy", &RknnOrtValue::numpy)
-      .def("update_inplace", &RknnOrtValue::update_inplace, py::arg("np_arr"))
-      .def("data_ptr", &RknnOrtValue::data_ptr)
-      .def("device_name", &RknnOrtValue::device_name)
-      .def("device_type", &RknnOrtValue::device_type)
-      .def("device_id", &RknnOrtValue::device_id)
-      .def("shape", &RknnOrtValue::shape)
-      .def("element_type",
-           [](const RknnOrtValue &value) {
-             return rknn_type_to_onnx_str(value.element_type());
-           })
-      .def("is_tensor", &RknnOrtValue::is_tensor)
-      .def("has_value", &RknnOrtValue::has_value)
-      .def("sync_to_device", [](RknnOrtValue &value) {
-        value.sync_to_device();
+          py::arg("layout") = "native")
+      .def("numpy", &PyOrtValue::numpy)
+      .def("update_inplace", &PyOrtValue::update, py::arg("np_arr"))
+      .def("data_ptr", [](const PyOrtValue &value) {
+        return reinterpret_cast<uintptr_t>(value.value().GetTensorRawData());
       })
-      .def("sync_from_device", [](RknnOrtValue &value) {
-        value.sync_from_device();
+      .def("device_name", [](const PyOrtValue &value) {
+        return value.value().GetMemoryInfo().device_type == smr::DeviceType::Cpu
+                   ? "cpu"
+                   : "rknpu2";
       })
-      .def("memory_info", &RknnOrtValue::memory_info);
+      .def("device_type", [](const PyOrtValue &value) {
+        return value.value().GetMemoryInfo().device_type == smr::DeviceType::Cpu
+                   ? "cpu"
+                   : "rknpu2";
+      })
+      .def("device_id", [](const PyOrtValue &value) {
+        return value.value().GetMemoryInfo().device_id;
+      })
+      .def("shape", [](const PyOrtValue &value) {
+        return value.value().GetTensorTypeAndShapeInfo().GetShape();
+      })
+      .def("element_type", [](const PyOrtValue &value) {
+        return element_to_onnx_string(
+            value.value().GetTensorTypeAndShapeInfo().GetElementType());
+      })
+      .def("is_tensor", [](const PyOrtValue &value) {
+        return value.value().IsTensor();
+      })
+      .def("has_value", [](const PyOrtValue &value) {
+        return value.value().HasValue();
+      })
+      .def("sync_to_device", [](PyOrtValue &value) {
+        value.value().SyncToDevice();
+      })
+      .def("sync_from_device", [](PyOrtValue &value) {
+        value.value().SyncFromDevice();
+      })
+      .def("memory_info", &memory_info_dict);
 
-  py::class_<RknnIoBinding, std::shared_ptr<RknnIoBinding>>(m,
-                                                            "SessionIOBinding")
-      .def("bind_cpu_input", &RknnIoBinding::bind_cpu_input, py::arg("name"),
+  py::class_<PyIOBinding, std::shared_ptr<PyIOBinding>>(module,
+                                                        "SessionIOBinding")
+      .def("bind_cpu_input", &PyIOBinding::bind_cpu_input, py::arg("name"),
            py::arg("arr_on_cpu"))
-      .def(
-          "bind_input",
-          [](RknnIoBinding &binding, const std::string &name,
-             const std::string &device_type, int device_id,
-             py::object element_type, py::object shape, py::object buffer_ptr) {
-            (void)binding;
-            (void)name;
-            (void)device_type;
-            (void)device_id;
-            (void)element_type;
-            (void)shape;
-            (void)buffer_ptr;
-            throw std::runtime_error(
-                "bind_input with raw buffer_ptr is not supported for RKNN "
-                "device memory because RKNN zero-copy requires a dma-buf fd "
-                "and a per-context rknn_create_mem_from_fd import. Use "
-                "bind_cpu_input for CPU arrays, bind_ortvalue_input for RKNN "
-                "OrtValue, or OrtValue.ortvalue_from_dmabuf for external "
-                "dma-buf memory.");
-          },
-          py::arg("name"), py::arg("device_type"), py::arg("device_id"),
-          py::arg("element_type"), py::arg("shape"), py::arg("buffer_ptr"))
-      .def("bind_ortvalue_input", &RknnIoBinding::bind_ortvalue_input,
+      .def("bind_input", [](PyIOBinding &, const std::string &,
+                            const std::string &, int, py::handle, py::handle,
+                            py::handle) {
+        throw std::runtime_error(
+            "bind_input with raw buffer_ptr is not supported; use an OrtValue "
+            "or OrtValue.ortvalue_from_dmabuf");
+      })
+      .def("bind_ortvalue_input", &PyIOBinding::bind_value_input,
            py::arg("name"), py::arg("ortvalue"))
-      .def("bind_ortvalue_output", &RknnIoBinding::bind_ortvalue_output,
+      .def("bind_ortvalue_output", &PyIOBinding::bind_value_output,
            py::arg("name"), py::arg("ortvalue"))
-      .def(
-          "bind_output",
-          [](RknnIoBinding &binding, const std::string &name,
-             const std::string &device_type, int device_id,
-             py::object element_type_obj, py::object shape_obj,
-             py::object buffer_ptr_obj, const std::string &layout,
-             py::object mem_flags_obj) {
-            (void)layout;
-            std::optional<rknn_tensor_type> element_type;
-            if (!element_type_obj.is_none()) {
-              element_type = dtype_like_to_rknn(element_type_obj, false);
-            }
-            std::optional<std::vector<int64_t>> shape;
-            if (!shape_obj.is_none()) {
-              shape = parse_shape_like(shape_obj, false);
-            }
-            std::optional<uint64_t> buffer_ptr;
-            if (!buffer_ptr_obj.is_none()) {
-              buffer_ptr = py::cast<uint64_t>(buffer_ptr_obj);
-            }
-            binding.bind_output(name, device_type, device_id, element_type,
-                                shape, buffer_ptr,
-                                parse_mem_flags(mem_flags_obj));
-          },
-          py::arg("name"), py::arg("device_type") = "cpu",
-          py::arg("device_id") = 0, py::arg("element_type") = py::none(),
-          py::arg("shape") = py::none(), py::arg("buffer_ptr") = py::none(),
-          py::kw_only(), py::arg("layout") = "native",
-          py::arg("mem_flags") = "cacheable")
-      .def("get_outputs", &RknnIoBinding::get_outputs)
-      .def("copy_outputs_to_cpu", &RknnIoBinding::copy_outputs_to_cpu)
-      .def("clear_binding_inputs", &RknnIoBinding::clear_binding_inputs)
-      .def("clear_binding_outputs", &RknnIoBinding::clear_binding_outputs)
-      .def("synchronize_inputs", &RknnIoBinding::synchronize_inputs)
-      .def("synchronize_outputs", &RknnIoBinding::synchronize_outputs);
+      .def("bind_output", [](PyIOBinding &binding, const std::string &name,
+                             const std::string &device_type, int device_id,
+                             py::handle element_type, py::handle shape,
+                             py::handle buffer_ptr, const std::string &,
+                             py::handle memory_flags) {
+        if (!buffer_ptr.is_none())
+          throw std::runtime_error(
+              "bind_output with raw buffer_ptr is not implemented");
+        std::optional<std::vector<int64_t>> parsed_shape;
+        if (!shape.is_none())
+          parsed_shape = parse_shape(shape);
+        binding.bind_output(name, device_type, device_id,
+                            dtype_like_to_element(element_type, true),
+                            std::move(parsed_shape),
+                            parse_memory_flags(memory_flags));
+      }, py::arg("name"), py::arg("device_type") = "cpu",
+           py::arg("device_id") = 0, py::arg("element_type") = py::none(),
+           py::arg("shape") = py::none(), py::arg("buffer_ptr") = py::none(),
+           py::kw_only(), py::arg("layout") = "native",
+           py::arg("mem_flags") = "cacheable")
+      .def("get_outputs", &PyIOBinding::outputs)
+      .def("copy_outputs_to_cpu", &PyIOBinding::copy_outputs)
+      .def("clear_binding_inputs", [](PyIOBinding &binding) {
+        binding.binding().ClearBoundInputs();
+      })
+      .def("clear_binding_outputs", [](PyIOBinding &binding) {
+        binding.binding().ClearBoundOutputs();
+      })
+      .def("synchronize_inputs", [](PyIOBinding &binding) {
+        binding.binding().SynchronizeInputs();
+      })
+      .def("synchronize_outputs", [](PyIOBinding &binding) {
+        binding.binding().SynchronizeOutputs();
+      });
+  module.attr("IOBinding") = module.attr("SessionIOBinding");
 
-  m.attr("IOBinding") = m.attr("SessionIOBinding");
-
-  py::class_<InferenceSession>(m, "InferenceSession")
-      .def(py::init([](py::object path_or_bytes, py::object sess_options,
-                       py::object providers, py::object provider_options,
+  py::class_<PySession>(module, "InferenceSession")
+      .def(py::init([](py::handle path_or_bytes, py::handle,
+                       py::handle, py::handle provider_options,
                        py::kwargs kwargs) {
-             (void)sess_options;
-             (void)providers;
-             py::object use_weight_from_obj = py::none();
-             const InferenceSession *use_weight_from = nullptr;
-             if (kwargs.contains("use_weight_from")) {
-               use_weight_from_obj = kwargs["use_weight_from"];
-               if (!use_weight_from_obj.is_none()) {
-                 try {
-                   use_weight_from =
-                       use_weight_from_obj.cast<InferenceSession *>();
-                 } catch (const py::cast_error &) {
-                   throw std::runtime_error(
-                       "use_weight_from must be an InferenceSession or None");
-                 }
-               }
-             }
-             SessionConfig config = parse_session_config(provider_options);
-             return std::make_unique<InferenceSession>(
-                 resolve_model_path(path_or_bytes), config, use_weight_from,
-                 std::move(use_weight_from_obj));
-           }),
-           py::arg("path_or_bytes"), py::arg("sess_options") = py::none(),
+        PySession *master = nullptr;
+        if (kwargs.contains("use_weight_from") &&
+            !kwargs["use_weight_from"].is_none())
+          master = kwargs["use_weight_from"].cast<PySession *>();
+        return std::make_unique<PySession>(path_or_bytes, provider_options,
+                                           master);
+      }), py::arg("path_or_bytes"), py::arg("sess_options") = py::none(),
            py::arg("providers") = py::none(),
-           py::arg("provider_options") = py::none(),
-           "Create an inference session.\n\n"
-           "ORT-style constructor. provider_options carries RKNN runtime "
-           "options, including custom op loading settings.\n"
-           "use_weight_from can be set to another initialized session whose "
-           "weight memory should be reused.")
-      .def("run", &InferenceSession::run, py::arg("output_names") = py::none(),
-           py::arg("input_feed"), py::arg("run_options") = py::none(),
-           "Run inference.\n\n"
-           "output_names: list of output names or None for all.\n"
-           "input_feed: dict(name->ndarray), list/tuple of ndarrays, or a "
-           "single ndarray.\n"
-           "run_options: supports key 'ztu_modelrt_dispatch_batch' (bool).")
-      .def("run_async", &InferenceSession::run_async, py::arg("output_names"),
+           py::arg("provider_options") = py::none())
+      .def("run", &PySession::run, py::arg("output_names") = py::none(),
+           py::arg("input_feed"), py::arg("run_options") = py::none())
+      .def("run_async", &PySession::run_async, py::arg("output_names"),
            py::arg("input_feed"), py::arg("callback"),
            py::arg("user_data") = py::none(),
-           py::arg("run_options") = py::none(),
-           "Run inference asynchronously.\n\n"
-           "ORT-style callback signature: callback(results, user_data, err).\n"
-           "Returns None.")
-      .def("run_pipeline", &InferenceSession::run_pipeline,
-           py::arg("input_feed"), py::arg("depth") = 3,
-           py::arg("reset") = false,
-           "Pipeline mode. Returns None until the pipeline is filled, then "
-           "returns\n"
-           "the oldest pending result. Use reset=True to clear the pipeline.")
-      .def("io_binding", &InferenceSession::io_binding,
-           "Create an ORT-style SessionIOBinding for RKNN zero-copy runs.")
-      .def("run_with_iobinding", &InferenceSession::run_with_iobinding,
-           py::arg("io_binding"), py::arg("run_options") = py::none(),
-           "Run inference with ORT-style I/O binding.")
-      .def("get_inputs", &InferenceSession::get_inputs,
-           "Return input NodeArg list (onnxruntime-style).")
-      .def("get_modelmeta", &InferenceSession::get_modelmeta,
-           "Return model metadata (onnxruntime-style).")
-      .def("get_outputs", &InferenceSession::get_outputs,
-           "Return output NodeArg list (onnxruntime-style).")
-      .def("get_native_inputs", &InferenceSession::get_native_inputs,
-           "Return RKNN native input NodeArg list for zero-copy binding.")
-      .def("get_native_outputs", &InferenceSession::get_native_outputs,
-           "Return RKNN native output NodeArg list for zero-copy binding.")
-      .def_property_readonly("input_names", &InferenceSession::input_names)
-      .def_property_readonly("output_names", &InferenceSession::output_names);
-
+           py::arg("run_options") = py::none())
+      .def("run_pipeline", &PySession::run_pipeline, py::arg("input_feed"),
+           py::arg("depth") = 3, py::arg("reset") = false)
+      .def("io_binding", [](PySession &session) {
+        return std::make_shared<PyIOBinding>(session.session());
+      })
+      .def("run_with_iobinding", [](PySession &session,
+                                    PyIOBinding &binding, py::handle options) {
+        auto parsed = parse_run_options(options);
+        py::gil_scoped_release release;
+        session.session().Run(parsed, binding.binding());
+      }, py::arg("io_binding"), py::arg("run_options") = py::none())
+      .def("get_inputs", [](const PySession &session) {
+        return const_cast<PySession &>(session).session().GetInputs();
+      })
+      .def("get_outputs", [](const PySession &session) {
+        return const_cast<PySession &>(session).session().GetOutputs();
+      })
+      .def("get_native_inputs", [](const PySession &session) {
+        return const_cast<PySession &>(session).session().GetNativeInputs();
+      })
+      .def("get_native_outputs", [](const PySession &session) {
+        return const_cast<PySession &>(session).session().GetNativeOutputs();
+      })
+      .def("get_modelmeta", [](const PySession &session) {
+        return const_cast<PySession &>(session).session().GetModelMetadata();
+      })
+      .def_property_readonly("input_names", [](const PySession &session) {
+        auto &native = const_cast<PySession &>(session).session();
+        std::vector<std::string> result;
+        for (size_t i = 0; i < native.GetInputCount(); ++i)
+          result.push_back(native.GetInputName(i));
+        return result;
+      })
+      .def_property_readonly("output_names", [](const PySession &session) {
+        auto &native = const_cast<PySession &>(session).session();
+        std::vector<std::string> result;
+        for (size_t i = 0; i < native.GetOutputCount(); ++i)
+          result.push_back(native.GetOutputName(i));
+        return result;
+      });
 }

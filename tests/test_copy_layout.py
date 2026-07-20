@@ -1,6 +1,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import threading
 
 import numpy as np
 import pytest
@@ -98,3 +99,57 @@ def test_copy_run_layout_inputs(nchw_add_model, layout, input_layout):
 
     assert actual.shape == model_shape
     np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def test_model_bytes_async_and_pipeline(nchw_add_model):
+    model_path, model_shape = nchw_add_model
+    session = ezrknn.InferenceSession(Path(model_path).read_bytes())
+    x, y = _make_inputs(model_shape)
+    expected = (x + y).astype(np.float16, copy=False)
+
+    completed = threading.Event()
+    callback_result = {}
+
+    def callback(outputs, user_data, error):
+        callback_result["outputs"] = outputs
+        callback_result["user_data"] = user_data
+        callback_result["error"] = error
+        completed.set()
+
+    session.run_async(None, {"x": x, "y": y}, callback, "token")
+    assert completed.wait(10)
+    assert callback_result["error"] == ""
+    assert callback_result["user_data"] == "token"
+    np.testing.assert_allclose(
+        callback_result["outputs"][0].astype(np.float16, copy=False),
+        expected,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    assert session.run_pipeline({"x": x, "y": y}, depth=1, reset=True) is None
+    pipelined = session.run_pipeline({"x": x, "y": y}, depth=1)
+    assert pipelined is not None
+    np.testing.assert_allclose(
+        pipelined[0].astype(np.float16, copy=False),
+        expected,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_dispatch_batch_uses_shared_cpp_core(nchw_add_model):
+    model_path, model_shape = nchw_add_model
+    session = ezrknn.InferenceSession(model_path)
+    x, y = _make_inputs(model_shape)
+    batch_x = np.concatenate([x, x + np.float16(1)], axis=0)
+    batch_y = np.concatenate([y, y - np.float16(2)], axis=0)
+    actual = session.run(
+        None,
+        {"x": batch_x, "y": batch_y},
+        {"ztu_modelrt_dispatch_batch": True},
+    )[0]
+    expected = (batch_x + batch_y).astype(np.float16, copy=False)
+    np.testing.assert_allclose(
+        actual.astype(np.float16, copy=False), expected, rtol=1e-2, atol=1e-2
+    )

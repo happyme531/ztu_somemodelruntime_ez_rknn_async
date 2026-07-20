@@ -19,6 +19,7 @@ LayoutLike = Literal[
     "nhwc",
     "any",
 ]
+ZeroCopyLayoutLike = Literal["nhwc", "native"]
 
 
 class RknnProviderOptions(TypedDict, total=False):
@@ -32,6 +33,7 @@ class RknnProviderOptions(TypedDict, total=False):
     """
 
     layout: LayoutLike
+    zero_copy_layout: ZeroCopyLayoutLike
     max_queue_size: int
     threads_per_core: int
     submit_timeout_ms: int
@@ -49,6 +51,7 @@ class RknnProviderOptions(TypedDict, total=False):
 def make_provider_options(
     *,
     layout: LayoutLike = "original",
+    zero_copy_layout: ZeroCopyLayoutLike = "nhwc",
     max_queue_size: int = 3,
     threads_per_core: int = 1,
     submit_timeout_ms: int = 10000,
@@ -65,6 +68,8 @@ def make_provider_options(
     Args:
         layout: Input layout policy. Common values are ``"nchw"(aka original)`` and
             ``"nhwc"``.
+        zero_copy_layout: Native I/O binding layout policy, ``"nhwc"`` or
+            ``"native"``.
         max_queue_size: Max pending task count in async queue, must be ``> 0``.
         threads_per_core: Worker thread count per selected NPU core, must be
             ``> 0``.
@@ -96,6 +101,7 @@ def make_provider_options(
 
     options: RknnProviderOptions = {
         "layout": layout,
+        "zero_copy_layout": zero_copy_layout,
         "max_queue_size": max_queue_size,
         "threads_per_core": threads_per_core,
         "submit_timeout_ms": submit_timeout_ms,
